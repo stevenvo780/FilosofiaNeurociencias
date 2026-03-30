@@ -84,7 +84,8 @@ def main():
             from enhance.esrgan import ESRGANEngine
             esr = ESRGANEngine()
         completed = run_pipeline(
-            chunks, src, work, prog, do_esr, do_rife, fps, esr)
+            chunks, src, work, prog, do_esr, do_rife, fps, esr,
+            w=w, h=h)
         wall = time.time() - t_go
         if wall > 0:
             print(f"\n  Processing: {wall/3600:.1f}h  "

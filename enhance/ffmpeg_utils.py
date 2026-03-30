@@ -75,7 +75,7 @@ def nvenc_encode(frames_dir: Path, out_file: Path, fps: float):
         "-preset", "p6", "-tune", "hq",
         "-rc", "vbr", "-cq", "20",
         "-b:v", "12M", "-maxrate", "18M", "-bufsize", "24M",
-        "-profile:v", "main10", "-pix_fmt", "yuv420p10le",
+        "-profile:v", "main10", "-pix_fmt", "p010le",
         "-threads", str(C.ENCODE_THREADS),
         str(out_file), "-loglevel", "warning",
     ]

@@ -2,8 +2,8 @@
 import os, signal, threading
 
 # ── ENV (must be before torch import) ───────────────────────
-if "CUDA_VISIBLE_DEVICES" not in os.environ:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+# Force both GPUs visible regardless of parent shell config
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 os.environ.setdefault("TORCH_COMPILE_THREADS", "4")
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 
