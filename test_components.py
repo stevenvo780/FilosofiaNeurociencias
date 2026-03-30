@@ -2,8 +2,9 @@
 """
 Component tests — validate each piece independently.
 Run:  python3 test_components.py
+      python3 test_components.py streaming   # run only streaming test
 """
-import sys, os, time, gc, subprocess
+import sys, os, time, gc, subprocess, json, threading
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 import numpy as np
@@ -213,19 +214,118 @@ def test_encode():
     return ok
 
 # ─────────────────────────────────────────────────────────────
-# TEST 4: Full pipeline 1 chunk (extract→ESRGAN→encode)
+# TEST 4: ESRGAN process_streaming → NVENC pipe (zero accumulation)
+# ─────────────────────────────────────────────────────────────
+def test_streaming():
+    separator("ESRGAN streaming → NVENC pipe (zero accumulation)")
+    from enhance.ffmpeg_utils import extract_frames_to_ram
+    from enhance.esrgan import ESRGANEngine
+    from enhance.pipeline import _open_nvenc_pipe, _ReorderWriter
+    import torch
+
+    out_file = Path("/tmp/test_streaming.mp4")
+    out_file.unlink(missing_ok=True)
+
+    # Extract frames
+    frames = extract_frames_to_ram(SRC, START, CHUNK_DUR, W, H)
+    n = len(frames)
+    raw_mb = sum(f.nbytes for f in frames) / 1e6
+    print(f"  Input: {n} frames ({raw_mb:.0f}MB)")
+
+    esr = ESRGANEngine()
+
+    # Output dimensions: 2x (4x ESRGAN on 0.5x downscale)
+    out_w, out_h = W * 2, H * 2
+
+    # Open NVENC pipe
+    proc = _open_nvenc_pipe(out_file, out_w, out_h, FPS, gpu=0)
+    writer = _ReorderWriter(proc.stdin, n)
+
+    ram0 = mem_mb()
+    t0 = time.time()
+    count = esr.process_streaming(frames, writer.on_frame)
+    writer.flush_remaining()
+
+    try:
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    proc.wait()
+    dt = time.time() - t0
+
+    # Free input + engine
+    del frames
+    del esr
+    torch.cuda.empty_cache()
+    gc.collect()
+    ram1 = mem_mb()
+
+    ok = True
+    print(f"  Processed: {count} frames")
+    print(f"  Written to pipe: {writer.written} frames")
+    print(f"  Time:  {dt:.1f}s  ({n/dt:.1f}fps end-to-end)")
+    print(f"  RSS:   {ram0:.0f} → {ram1:.0f}MB")
+
+    if writer.written != n:
+        print(f"  ❌ FAIL: wrote {writer.written}/{n}")
+        ok = False
+
+    if proc.returncode != 0:
+        print(f"  ❌ FAIL: NVENC rc={proc.returncode}")
+        ok = False
+
+    if out_file.exists():
+        sz = out_file.stat().st_size
+        print(f"  Output: {sz/1e6:.1f}MB")
+        # Verify with ffprobe
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=width,height,nb_frames,codec_name",
+             "-print_format", "json", str(out_file)],
+            capture_output=True, text=True)
+        info = json.loads(r.stdout)
+        stream = info["streams"][0]
+        print(f"  Codec: {stream.get('codec_name')}  "
+              f"{stream.get('width')}x{stream.get('height')}  "
+              f"frames={stream.get('nb_frames')}")
+        if stream.get("codec_name") != "hevc":
+            print(f"  ❌ FAIL: expected hevc")
+            ok = False
+        probe_w = int(stream.get("width", 0))
+        probe_h = int(stream.get("height", 0))
+        if probe_w != out_w or probe_h != out_h:
+            print(f"  ❌ FAIL: expected {out_w}x{out_h}, got {probe_w}x{probe_h}")
+            ok = False
+    else:
+        print(f"  ❌ FAIL: output file not created")
+        ok = False
+
+    # Check reorder buffer is empty
+    if writer.buf:
+        print(f"  ❌ FAIL: {len(writer.buf)} orphan frames in reorder buffer")
+        ok = False
+
+    out_file.unlink(missing_ok=True)
+    if ok:
+        print(f"  ✅ PASS")
+    return ok
+
+
+# ─────────────────────────────────────────────────────────────
+# TEST 5: Full pipeline 1 chunk (extract→ESRGAN→encode)
 # ─────────────────────────────────────────────────────────────
 def test_pipeline_1chunk():
-    separator("Pipeline 1 chunk (extract→ESRGAN→NVENC)")
+    separator("Pipeline 1 chunk (streaming: extract→ESRGAN→NVENC pipe)")
     import shutil
     from enhance.ffmpeg_utils import extract_frames_to_ram
     from enhance.esrgan import ESRGANEngine
-    from enhance.pipeline import _encode_from_numpy
+    from enhance.pipeline import _open_nvenc_pipe, _ReorderWriter
     import torch
 
     out_file = Path("/tmp/test_pipeline.mp4")
     out_file.unlink(missing_ok=True)
 
+    out_w, out_h = W * 2, H * 2
     ram0 = mem_mb()
     print(f"  RSS start: {ram0:.0f}MB")
 
@@ -239,26 +339,26 @@ def test_pipeline_1chunk():
     print(f"  [Extract] {n} frames  {t_ext:.1f}s  {n/t_ext:.0f}fps  "
           f"RSS={ram1:.0f}MB (+{ram1-ram0:.0f}MB, data={raw_mb:.0f}MB)")
 
-    # Stage 2: ESRGAN
+    # Stage 2: ESRGAN → NVENC streaming
     esr = ESRGANEngine()
+    proc = _open_nvenc_pipe(out_file, out_w, out_h, FPS, gpu=0)
+    writer = _ReorderWriter(proc.stdin, n)
+
     t1 = time.time()
-    results = esr.process_frames(frames, out_dir=None)
-    t_esr = time.time() - t1
+    esr.process_streaming(frames, writer.on_frame)
+    writer.flush_remaining()
+    try:
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    proc.wait()
+    t_esr_enc = time.time() - t1
+
     del frames  # free raw
     gc.collect()
     ram2 = mem_mb()
-    out_mb = sum(r.nbytes for r in results if r is not None) / 1e6
-    print(f"  [ESRGAN]  {len(results)} frames  {t_esr:.1f}s  {n/t_esr:.1f}fps  "
-          f"RSS={ram2:.0f}MB (raw freed, out={out_mb:.0f}MB)")
-
-    # Stage 3: Encode
-    t2 = time.time()
-    _encode_from_numpy(results, out_file, FPS, gpu=0)
-    t_enc = time.time() - t2
-    del results  # free ESRGAN output
-    gc.collect()
-    ram3 = mem_mb()
-    print(f"  [NVENC]   {t_enc:.1f}s  ({n/t_enc:.1f}fps)  RSS={ram3:.0f}MB")
+    print(f"  [Stream] {writer.written} frames  {t_esr_enc:.1f}s  "
+          f"{n/t_esr_enc:.1f}fps  RSS={ram2:.0f}MB (raw freed)")
 
     # Cleanup
     del esr
@@ -291,6 +391,7 @@ if __name__ == "__main__":
         ("extract", test_extract),
         ("esrgan", test_esrgan),
         ("encode", test_encode),
+        ("streaming", test_streaming),
         ("pipeline", test_pipeline_1chunk),
     ]
 
