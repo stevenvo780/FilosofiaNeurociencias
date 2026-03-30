@@ -1,0 +1,19 @@
+============================================================
+  AI VIDEO ENHANCEMENT
+============================================================
+  Input:  GMT20260320-130023_Recording_2240x1260.mp4  (7.4h, 2240x1260 @ 25.0fps)
+  Output: GMT20260320-130023_Recording_2240x1260_ai_50fps.mp4  (4480x2520 @ 50.0fps)
+  Frames: ~665,109  |  Chunks: 30s each
+  ESRGAN: ON  |  RIFE: ON
+  Tmpfs:  /tmp/enhance_work  (frames in RAM, zero disk I/O)
+============================================================
+
+  2 chunks total, 0 done, 2 remaining
+
+  [ESRGAN] GPU0 NVIDIA GeForce RTX 5070 Ti  batch=8
+    warm  VRAM=0.14GB
+  [ESRGAN] GPU1 NVIDIA GeForce RTX 2060  batch=4
+    warm  VRAM=0.07GB
+  [ESRGAN] CPU Worker (AMD Threads=16)  batch=1
+
+  == Chunk 0000  [0s–30s] ==

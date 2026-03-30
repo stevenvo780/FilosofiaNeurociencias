@@ -2,8 +2,8 @@
 ESRGAN engine — dual-GPU batched inference + CPU Multi-Thread inference.
 
 Key optimizations:
-  - Double-buffered pinned memory: CPU preps batch N+1 while GPU runs batch N
-  - CPU worker offloads chunks explicitly processing via `torch.set_num_threads`
+  - Dynamic Task Allocation: GPUs and CPU independently pull frame indexes avoiding static blocks.
+  - Double-buffered pinned memory: Preps batch N+1 while GPU runs batch N dynamically.
 """
 import time, threading
 from pathlib import Path
@@ -44,7 +44,6 @@ class ESRGANEngine:
             self.models.append(net)
             self.streams.append(torch.cuda.Stream(device=dev))
 
-            # Warmup
             dummy = torch.randn(bs, 3, 315, 560, device=dev, dtype=torch.float16)
             with torch.inference_mode():
                 _ = net(dummy)
@@ -55,7 +54,6 @@ class ESRGANEngine:
             vram = torch.cuda.memory_allocated(gid) / 1e9
             print(f"    warm  VRAM={vram:.2f}GB")
 
-        # Configure CPU inference
         self.cpu_enabled = C.CPU_SHARE > 0.0
         if self.cpu_enabled:
             print(f"  [ESRGAN] CPU Worker (AMD Threads=16)  batch=1")
@@ -69,21 +67,20 @@ class ESRGANEngine:
                 _ = self.cpu_model(dummy)
             del dummy
 
-    def _gpu_worker(self, gid: int, work_frames: list[np.ndarray],
-                    base_idx: int, store: list | None,
-                    on_frame: Callable | None,
-                    counter: list, lock: threading.Lock,
-                    total: int, t0: float):
+    def _gpu_worker(self, gid: int, frames: list[np.ndarray], get_batch: Callable,
+                    store: list | None, on_frame: Callable | None,
+                    counter: list, lock: threading.Lock, total: int, t0: float):
         torch = self.torch
         net = self.models[gid]
         dev = f"cuda:{gid}"
         bs = self.batches[gid]
         stream = self.streams[gid]
-        n = len(work_frames)
-        if n == 0:
+
+        start, end = get_batch(bs)
+        if start is None:
             return
 
-        sample_h, sample_w = work_frames[0].shape[:2]
+        sample_h, sample_w = frames[start].shape[:2]
 
         pinned = [
             torch.empty(bs, sample_h, sample_w, 3,
@@ -92,25 +89,23 @@ class ESRGANEngine:
                         dtype=torch.uint8, pin_memory=True),
         ]
 
-        first_n = min(bs, n)
-        for i in range(first_n):
-            pinned[0][i].copy_(torch.from_numpy(work_frames[i]))
-
+        cur_bs = end - start
+        for i in range(cur_bs):
+            pinned[0][i].copy_(torch.from_numpy(frames[start + i]))
+            
         buf_idx = 0
-        pos = 0
         prev_out_cpu = None
-        prev_pos = 0
+        prev_start = 0
         prev_bs = 0
 
-        while pos < n:
+        while cur_bs > 0:
             if C.shutdown.is_set():
                 return
-
+            
             cur_buf = buf_idx
-            cur_bs = min(bs, n - pos)
-            next_pos = pos + cur_bs
+            next_start, next_end = get_batch(bs)
+            next_bs = next_end - next_start if next_start is not None else 0
             next_buf = 1 - buf_idx
-            has_next = next_pos < n
 
             with torch.cuda.stream(stream):
                 t_gpu = (pinned[cur_buf][:cur_bs]
@@ -131,9 +126,9 @@ class ESRGANEngine:
             if prev_out_cpu is not None:
                 out_np = prev_out_cpu.numpy()
                 for i in range(prev_bs):
-                    gidx = base_idx + prev_pos + i
+                    gidx = prev_start + i
                     if store is not None:
-                        store[gidx] = out_np[i].copy()
+                        store[gidx] = out_np[i].copy() # explicit random access memory insertion
                     if on_frame is not None:
                         on_frame(gidx, out_np[i])
                 del prev_out_cpu
@@ -150,27 +145,27 @@ class ESRGANEngine:
                               f"{fps_now:.1f}fps  ETA {eta:.0f}s",
                               flush=True)
 
-            if has_next:
-                next_n = min(bs, n - next_pos)
-                for i in range(next_n):
+            if next_bs > 0:
+                for i in range(next_bs):
                     pinned[next_buf][i].copy_(
-                        torch.from_numpy(work_frames[next_pos + i]))
+                        torch.from_numpy(frames[next_start + i]))
 
             torch.cuda.synchronize(gid)
 
             prev_out_cpu = out_cpu
-            prev_pos = pos
+            prev_start = start
             prev_bs = cur_bs
 
             del t_gpu, t_small, out, out_u8
 
             buf_idx = next_buf
-            pos = next_pos
+            start = next_start
+            cur_bs = next_bs
 
         if prev_out_cpu is not None:
             out_np = prev_out_cpu.numpy()
             for i in range(prev_bs):
-                gidx = base_idx + prev_pos + i
+                gidx = prev_start + i
                 if store is not None:
                     store[gidx] = out_np[i].copy()
                 if on_frame is not None:
@@ -190,23 +185,20 @@ class ESRGANEngine:
         del pinned
 
 
-    def _cpu_worker(self, work_frames: list[np.ndarray],
-                    base_idx: int, store: list | None,
-                    on_frame: Callable | None,
-                    counter: list, lock: threading.Lock,
-                    total: int, t0: float):
-        """Process a slice of frames on CPU entirely, overlapping with GPU computation."""
+    def _cpu_worker(self, frames: list[np.ndarray], get_batch: Callable,
+                    store: list | None, on_frame: Callable | None,
+                    counter: list, lock: threading.Lock, total: int, t0: float):
         torch = self.torch
         net = self.cpu_model
-        n = len(work_frames)
-        if n == 0:
-            return
 
-        for pos in range(n):
+        while True:
+            start, _ = get_batch(1)
+            if start is None:
+                break
             if C.shutdown.is_set():
                 return
             
-            frame = work_frames[pos]
+            frame = frames[start]
             t_cpu = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0).to("cpu", dtype=torch.float32) / 255.0
 
             t_small = torch.nn.functional.interpolate(
@@ -219,7 +211,7 @@ class ESRGANEngine:
             out_u8 = (out.clamp(0, 1) * 255).byte()
             out_cpu_frame = out_u8[0].permute(1, 2, 0).numpy()
 
-            gidx = base_idx + pos
+            gidx = start
             if store is not None:
                 store[gidx] = out_cpu_frame.copy()
             if on_frame is not None:
@@ -241,42 +233,48 @@ class ESRGANEngine:
     def _run_parallel(self, frames: list[np.ndarray],
                       store: list | None,
                       on_frame: Callable | None) -> int:
-        """Dispatch frames to dual-GPU and CPU multi-thread workers."""
+        """Dispatch dynamically fetching threads."""
         total = len(frames)
         if total == 0:
             return 0
 
-        # Adjust indices according to user HW architecture and settings Configs
-        split0 = int(total * C.GPU0_SHARE)
-        split1 = split0 + int(total * C.GPU1_SHARE) if self.ngpu > 1 else split0
-
-        gpu0_frames = frames[:split0]
-        gpu1_frames = frames[split0:split1] if self.ngpu > 1 else []
-        cpu_frames = frames[split1:] if self.cpu_enabled else (frames[split0:] if self.ngpu == 1 else [])
+        pos = [0]
+        lock = threading.Lock()
+        
+        def get_batch(batch_size):
+            with lock:
+                if pos[0] >= total:
+                    return None, 0
+                start = pos[0]
+                end = min(total, start + batch_size)
+                pos[0] = end
+                return start, end
 
         counter = [0]
-        lock = threading.Lock()
         t0 = time.time()
 
         threads = []
-        if gpu0_frames:
+        
+        # Deploy fetching worker for GPU0 (Fastest: Pulls 8 frames automatically)
+        t = threading.Thread(
+            target=self._gpu_worker,
+            args=(0, frames, get_batch, store, on_frame, counter, lock, total, t0))
+        t.start()
+        threads.append(t)
+        
+        # Deploy fetching worker for GPU1 (Slightly Slower: Pulls 4 frames automatically)
+        if self.ngpu > 1:
             t = threading.Thread(
                 target=self._gpu_worker,
-                args=(0, gpu0_frames, 0, store, on_frame, counter, lock, total, t0))
+                args=(1, frames, get_batch, store, on_frame, counter, lock, total, t0))
             t.start()
             threads.append(t)
             
-        if gpu1_frames:
-            t = threading.Thread(
-                target=self._gpu_worker,
-                args=(1, gpu1_frames, split0, store, on_frame, counter, lock, total, t0))
-            t.start()
-            threads.append(t)
-            
-        if self.cpu_enabled and cpu_frames:
+        # Deploy fetching worker for CPU (R9 Processor: Pulls 1 frame slowly behind them)
+        if self.cpu_enabled:
             t = threading.Thread(
                 target=self._cpu_worker,
-                args=(cpu_frames, split1 if self.ngpu > 1 else split0, store, on_frame, counter, lock, total, t0))
+                args=(frames, get_batch, store, on_frame, counter, lock, total, t0))
             t.start()
             threads.append(t)
 

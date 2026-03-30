@@ -1,0 +1,10 @@
+--- CPU % (1028715) ---
+ 0.0  0.0 12484
+--- GPU % ---
+0, NVIDIA GeForce RTX 5070 Ti, 0 %, 0 %, P1
+1, NVIDIA GeForce RTX 2060, 0 %, 3 %, P8
+--- CPU % (1028715) ---
+ 306  3.1 4080112
+--- GPU % ---
+0, NVIDIA GeForce RTX 5070 Ti, 2 %, 1 %, P1
+1, NVIDIA GeForce RTX 2060, 9 %, 6 %, P2
