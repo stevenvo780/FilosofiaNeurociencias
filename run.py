@@ -25,13 +25,18 @@ def main():
                     help=f"Chunk duration seconds (default {C.CHUNK_SECONDS})")
     ap.add_argument("--clean", action="store_true",
                     help="Clean work directory and restart")
+    ap.add_argument("--outdir", type=str, default=None,
+                    help="Output directory (default: <input_dir>/enhanced)")
     args = ap.parse_args()
 
     src = Path(args.input).resolve()
     if not src.exists():
         print(f"[!] Not found: {src}"); sys.exit(1)
 
-    out_dir = src.parent / "enhanced"
+    if args.outdir:
+        out_dir = Path(args.outdir).resolve()
+    else:
+        out_dir = src.parent / "enhanced"
     out_dir.mkdir(exist_ok=True)
     work = out_dir / f"work_{src.stem}"
 

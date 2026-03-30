@@ -14,10 +14,10 @@ RIFE_MODEL_DIR  = "/tmp/rife-ncnn/rife-ncnn-vulkan-20221029-ubuntu/rife-v4.6"
 TMPFS_WORK      = "/tmp/enhance_work"   # tmpfs ramdisk for intermediate frames
 
 # ── TUNING ──────────────────────────────────────────────────
-CHUNK_SECONDS   = 120
+CHUNK_SECONDS   = 30
 GPU0_BATCH      = 8
 GPU1_BATCH      = 4
-GPU0_SHARE      = 0.70      # fraction of frames for GPU0
+GPU0_SHARE      = 0.76      # 33fps/(33+10.5fps) — both GPUs finish together
 READ_WORKERS    = 16        # CPU threads for PNG reads
 WRITE_WORKERS   = 16        # CPU threads for PNG writes
 EXTRACT_THREADS = 4         # <=4 to avoid NVDEC "too many surfaces" error

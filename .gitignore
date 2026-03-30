@@ -1,4 +1,6 @@
 enhanced/
-GMT*
-
-*/__pycache__/*
+*.mp4
+*.m4a
+*/__pycache__/
+__pycache__/
+*.pyc*

@@ -69,16 +69,10 @@ class ESRGANEngine:
                     total: int, t0: float):
         """Process a slice of frames on one GPU.
 
-        Args:
-            gid:         GPU index
-            work_frames: the numpy frame slice this GPU owns (NOT a closure)
-            base_idx:    global index of first frame in work_frames
-            store:       if not None, collect results[global_idx] = frame
-            on_frame:    if not None, call on_frame(global_idx, np_array) per frame
-            counter:     shared [count] for progress
-            lock:        shared lock for counter
-            total:       total frames across all GPUs
-            t0:          start time
+        Pipeline overlap strategy:
+          While GPU runs batch N+1, CPU delivers batch N results.
+          For streaming (on_frame): pass numpy view directly, no .copy().
+          For store mode (RIFE): .copy() runs overlapped with next GPU batch.
         """
         torch = self.torch
         net = self.models[gid]
@@ -106,6 +100,10 @@ class ESRGANEngine:
 
         buf_idx = 0
         pos = 0
+        # Previous batch results waiting to be delivered
+        prev_out_cpu = None
+        prev_pos = 0
+        prev_bs = 0
 
         while pos < n:
             if C.shutdown.is_set():
@@ -117,7 +115,7 @@ class ESRGANEngine:
             next_buf = 1 - buf_idx
             has_next = next_pos < n
 
-            # GPU inference on current batch
+            # Launch GPU inference (async, returns immediately)
             with torch.cuda.stream(stream):
                 t_gpu = (pinned[cur_buf][:cur_bs]
                          .permute(0, 3, 1, 2)
@@ -134,40 +132,73 @@ class ESRGANEngine:
                 out_u8 = (out.clamp(0, 1) * 255).byte()
                 out_cpu = out_u8.permute(0, 2, 3, 1).cpu()
 
-            # CPU: prep next batch while GPU might still finish
+            # ── OVERLAP ZONE: GPU runs current batch, CPU does these ──
+
+            # 1) Deliver PREVIOUS batch results (overlapped with GPU)
+            if prev_out_cpu is not None:
+                out_np = prev_out_cpu.numpy()
+                for i in range(prev_bs):
+                    gidx = base_idx + prev_pos + i
+                    if store is not None:
+                        store[gidx] = out_np[i].copy()
+                    if on_frame is not None:
+                        # No .copy() — write view directly, discard after
+                        on_frame(gidx, out_np[i])
+                del prev_out_cpu
+                prev_out_cpu = None
+
+                with lock:
+                    counter[0] += prev_bs
+                    c = counter[0]
+                    if c % 50 < bs or c >= total:
+                        elapsed = time.time() - t0
+                        fps_now = c / elapsed if elapsed > 0 else 0
+                        eta = (total - c) / fps_now if fps_now > 0 else 0
+                        print(f"    ESRGAN {c}/{total}  "
+                              f"{fps_now:.1f}fps  ETA {eta:.0f}s",
+                              flush=True)
+
+            # 2) Prep NEXT batch into pinned (overlapped with GPU)
             if has_next:
                 next_n = min(bs, n - next_pos)
                 for i in range(next_n):
                     pinned[next_buf][i].copy_(
                         torch.from_numpy(work_frames[next_pos + i]))
 
+            # Wait for GPU to finish current batch
             torch.cuda.synchronize(gid)
 
-            # Deliver results — store and/or stream
-            out_np = out_cpu.numpy()
-            for i in range(cur_bs):
-                gidx = base_idx + pos + i
-                frame_np = out_np[i].copy()
-                if store is not None:
-                    store[gidx] = frame_np
-                if on_frame is not None:
-                    on_frame(gidx, frame_np)
+            # Stash current results — deliver them next iteration
+            # (while GPU runs the NEXT batch)
+            prev_out_cpu = out_cpu
+            prev_pos = pos
+            prev_bs = cur_bs
 
-            del t_gpu, t_small, out, out_u8, out_cpu, out_np
+            del t_gpu, t_small, out, out_u8
 
             buf_idx = next_buf
             pos = next_pos
 
+        # Deliver final batch results
+        if prev_out_cpu is not None:
+            out_np = prev_out_cpu.numpy()
+            for i in range(prev_bs):
+                gidx = base_idx + prev_pos + i
+                if store is not None:
+                    store[gidx] = out_np[i].copy()
+                if on_frame is not None:
+                    on_frame(gidx, out_np[i])
+            del prev_out_cpu
+
             with lock:
-                counter[0] += cur_bs
+                counter[0] += prev_bs
                 c = counter[0]
-                if c % 50 < bs or c >= total:
-                    elapsed = time.time() - t0
-                    fps_now = c / elapsed if elapsed > 0 else 0
-                    eta = (total - c) / fps_now if fps_now > 0 else 0
-                    print(f"    ESRGAN {c}/{total}  "
-                          f"{fps_now:.1f}fps  ETA {eta:.0f}s",
-                          flush=True)
+                elapsed = time.time() - t0
+                fps_now = c / elapsed if elapsed > 0 else 0
+                eta = (total - c) / fps_now if fps_now > 0 else 0
+                print(f"    ESRGAN {c}/{total}  "
+                      f"{fps_now:.1f}fps  ETA {eta:.0f}s",
+                      flush=True)
 
         del pinned
 
