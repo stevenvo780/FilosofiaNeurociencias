@@ -1,2 +1,4 @@
 enhanced/
 GMT*
+
+*/__pycache__/*
