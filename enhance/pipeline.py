@@ -8,8 +8,13 @@ Zero-PNG path (no RIFE):
 
 RIFE path (needs files):
   ffmpeg pipe → numpy RAM → GPU ESRGAN → PNGs on tmpfs → RIFE → NVENC
+
+Memory management:
+  - enc_q maxsize=2: at most 2 chunks of ESRGAN output (~50GB) queued
+  - Explicit del + gc.collect() after freeing large arrays
+  - Input frames freed immediately after ESRGAN consumes them
 """
-import time, shutil, threading, queue, subprocess
+import time, shutil, threading, queue, subprocess, gc
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -31,7 +36,8 @@ def _tmpfs_chunk(cid: int) -> Path:
 
 def _encode_from_numpy(frames: list[np.ndarray], out_file: Path,
                         fps: float, gpu: int = 0):
-    """Pipe numpy RGB frames directly to NVENC — zero PNG I/O."""
+    """Pipe numpy RGB frames directly to NVENC — zero PNG I/O.
+    Uses memoryview to avoid .tobytes() copies."""
     if out_file.exists() and out_file.stat().st_size > 1000:
         return
     if not frames:
@@ -50,10 +56,15 @@ def _encode_from_numpy(frames: list[np.ndarray], out_file: Path,
         "-profile:v", "main10", "-pix_fmt", "p010le",
         str(out_file), "-loglevel", "warning",
     ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    for f in frames:
-        proc.stdin.write(f.tobytes())
-    proc.stdin.close()
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                            bufsize=w * h * 3 * 8)
+    try:
+        for f in frames:
+            # Write raw buffer directly — no .tobytes() copy
+            proc.stdin.write(memoryview(np.ascontiguousarray(f)))
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
     proc.wait()
     if proc.returncode != 0:
         raise RuntimeError(f"NVENC encode failed (rc={proc.returncode})")
@@ -87,8 +98,9 @@ def run(chunks, src: Path, work: Path, prog: Progress,
 
     Path(C.TMPFS_WORK).mkdir(parents=True, exist_ok=True)
 
-    # Background encoder queue (used only when RIFE produces PNGs)
-    enc_q: queue.Queue = queue.Queue()
+    # ── BACKPRESSURE: maxsize=2 limits RAM to ~50GB of queued ESRGAN output
+    #    Without this, the queue grows unbounded → OOM on 128GB system
+    enc_q: queue.Queue = queue.Queue(maxsize=2)
 
     def _encoder():
         while True:
@@ -128,7 +140,9 @@ def run(chunks, src: Path, work: Path, prog: Progress,
                               flush=True)
                     except Exception as e:
                         print(f"  [!] Encode chunk {cid:04d} failed: {e}")
+                # Explicitly free the numpy frames ASAP
                 del np_frames
+                gc.collect()
             enc_q.task_done()
 
     enc_thread = threading.Thread(target=_encoder, daemon=True, name="encoder")
@@ -156,7 +170,7 @@ def run(chunks, src: Path, work: Path, prog: Progress,
                   f"{n/dt:.0f}fps)", flush=True)
             prog.mark(cid, "extract")
         elif do_esr and not prog.done(cid, "esrgan"):
-            # Need frames for ESRGAN but extract was done — re-extract to RAM
+            # Need frames for ESRGAN but extract marked done — re-extract
             frames = extract_frames_to_ram(src, start, dur, w, h)
 
         # ── Stage 2: ESRGAN (Tensor Cores FP16) — numpy → numpy ──
@@ -172,43 +186,49 @@ def run(chunks, src: Path, work: Path, prog: Progress,
                 n = len(esr_frames)
                 print(f"  | ESRGAN: {n} frames  ({time.time()-tc:.1f}s)",
                       flush=True)
-                # Free raw frames immediately
+                # Free raw frames immediately (~4.6GB per chunk)
                 del frames
                 frames = None
+                gc.collect()
 
         # ── Stage 3: RIFE (Vulkan compute) — needs PNGs on tmpfs ──
         out_fps = fps
         if do_rife:
-            # RIFE binary needs PNG files — write to tmpfs
             rife_in = _tmpfs_chunk(cid) / "esrgan"
             rife_out = _tmpfs_chunk(cid) / "rife"
             if not prog.done(cid, "rife"):
                 src_frames = esr_frames if esr_frames is not None else frames
                 if src_frames is not None:
                     _write_pngs(src_frames, rife_in)
-                    del src_frames, esr_frames, frames
+                    del src_frames
+                    if esr_frames is not None:
+                        del esr_frames
+                    if frames is not None:
+                        del frames
                     esr_frames = frames = None
+                    gc.collect()
                 tr = time.time()
                 n = rife_interpolate(rife_in, rife_out)
                 prog.mark(cid, "rife")
                 print(f"  | RIFE:   {n} frames  ({time.time()-tr:.1f}s)",
                       flush=True)
-                # Free ESRGAN PNGs
                 shutil.rmtree(rife_in, ignore_errors=True)
             out_fps = fps * 2
-            # Encode from PNG dir (RIFE output)
             enc_q.put((cid, rife_out, out_fps))
         else:
-            # ── Stage 4: NVENC — pipe numpy in background thread ──
+            # ── Stage 4: NVENC — queue for background encode ──
+            #    enc_q.put() BLOCKS if queue is full (maxsize=2)
+            #    This is the backpressure that prevents OOM
             disk_dir = work / f"chunk_{cid:04d}"
             vid = disk_dir / "output.mp4"
             if not prog.done(cid, "encode"):
                 src_frames = esr_frames if esr_frames is not None else frames
                 if src_frames is not None:
-                    # Queue encode to run in background while next chunk processes
                     enc_q.put((cid, src_frames, fps, vid))
-            # Free references (data owned by enc_q now)
-            del esr_frames, frames
+                    # References handed to queue; clear locals
+                    src_frames = None
+            esr_frames = None
+            frames = None
 
         completed += 1
         wall = time.time() - t_start
@@ -217,7 +237,7 @@ def run(chunks, src: Path, work: Path, prog: Progress,
         print(f"  | Progress: {completed}/{total} ({100*completed/total:.1f}%)  "
               f"ETA {rem/3600:.1f}h", flush=True)
 
-    # Drain encoder queue
+    # Drain encoder queue — wait for all queued chunks to finish
     enc_q.join()
     enc_q.put(None)
     return completed
