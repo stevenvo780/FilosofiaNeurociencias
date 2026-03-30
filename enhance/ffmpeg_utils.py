@@ -1,5 +1,6 @@
 """ffmpeg helpers: probe, extract frames, NVENC encode, merge."""
 import json, subprocess
+import numpy as np
 from pathlib import Path
 from . import config as C
 
@@ -19,9 +20,33 @@ def probe(path: Path):
     raise RuntimeError("no video stream found")
 
 
+def extract_frames_to_ram(src: Path, start: float, dur: float,
+                          w: int, h: int) -> list[np.ndarray]:
+    """Extract frames via ffmpeg pipe → list of numpy arrays in RAM.
+    No disk I/O at all. Uses software decode (CPU) which is plenty fast."""
+    cmd = [
+        "ffmpeg",
+        "-ss", str(start), "-i", str(src), "-t", str(dur),
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-threads", str(C.EXTRACT_THREADS),
+        "-v", "error", "-"
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            bufsize=w * h * 3 * 4)
+    frame_bytes = w * h * 3
+    frames = []
+    while True:
+        raw = proc.stdout.read(frame_bytes)
+        if len(raw) < frame_bytes:
+            break
+        frames.append(np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3))
+    proc.wait()
+    return frames
+
+
 def extract_frames(src: Path, start: float, dur: float,
                    out_dir: Path, fps: float) -> int:
-    """Extract frames via NVDEC hw decode → PNGs."""
+    """Extract frames to PNGs (fallback for RIFE which needs files)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     expected = int(dur * fps)
     existing = len(list(out_dir.glob("*.png")))
@@ -30,7 +55,6 @@ def extract_frames(src: Path, start: float, dur: float,
 
     cmd = [
         "ffmpeg", "-y",
-        "-hwaccel", "cuda", "-hwaccel_device", "0",
         "-ss", str(start), "-i", str(src), "-t", str(dur),
         "-pix_fmt", "rgb24", "-threads", str(C.EXTRACT_THREADS),
         str(out_dir / "%08d.png"), "-loglevel", "warning",

@@ -57,6 +57,7 @@ def main():
     print(f"  Output: {dst.name}  ({w*scale}x{h*scale} @ {out_fps}fps)")
     print(f"  Frames: ~{total_frames:,}  |  Chunks: {args.chunk}s each")
     print(f"  ESRGAN: {'ON' if do_esr else 'SKIP'}  |  RIFE: {'ON' if do_rife else 'SKIP'}")
+    print(f"  Tmpfs:  {C.TMPFS_WORK}  (frames in RAM, zero disk I/O)")
     print("=" * 60)
 
     prog = Progress(work)

@@ -11,6 +11,7 @@ os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 ESRGAN_MODEL    = "/tmp/realesr-animevideov3.pth"
 RIFE_BIN        = "/tmp/rife-ncnn/rife-ncnn-vulkan-20221029-ubuntu/rife-ncnn-vulkan"
 RIFE_MODEL_DIR  = "/tmp/rife-ncnn/rife-ncnn-vulkan-20221029-ubuntu/rife-v4.6"
+TMPFS_WORK      = "/tmp/enhance_work"   # tmpfs ramdisk for intermediate frames
 
 # ── TUNING ──────────────────────────────────────────────────
 CHUNK_SECONDS   = 120
@@ -19,7 +20,7 @@ GPU1_BATCH      = 4
 GPU0_SHARE      = 0.70      # fraction of frames for GPU0
 READ_WORKERS    = 16        # CPU threads for PNG reads
 WRITE_WORKERS   = 16        # CPU threads for PNG writes
-EXTRACT_THREADS = 8
+EXTRACT_THREADS = 4         # <=4 to avoid NVDEC "too many surfaces" error
 ENCODE_THREADS  = 4
 NVENC_GPU       = 0
 RIFE_GPU_STR    = "4:4:4"
