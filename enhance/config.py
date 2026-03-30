@@ -17,13 +17,14 @@ TMPFS_WORK      = "/tmp/enhance_work"   # tmpfs ramdisk for intermediate frames
 CHUNK_SECONDS   = 30
 GPU0_BATCH      = 8
 GPU1_BATCH      = 4
-GPU0_SHARE      = 0.76      # 33fps/(33+10.5fps) — both GPUs finish together
+GPU0_SHARE      = 0.65      # RTX 5070
+GPU1_SHARE      = 0.20      # RTX 2060
+CPU_SHARE       = 0.15      # AMD Ryzen 9 9950X3D CPU
 READ_WORKERS    = 16        # CPU threads for PNG reads
 WRITE_WORKERS   = 16        # CPU threads for PNG writes
 EXTRACT_THREADS = 4         # <=4 to avoid NVDEC "too many surfaces" error
 ENCODE_THREADS  = 4
 NVENC_GPU       = 0
-RIFE_GPU_STR    = "4:4:4"
 PIPELINE_DEPTH  = 3
 
 # ── GRACEFUL SHUTDOWN ───────────────────────────────────────

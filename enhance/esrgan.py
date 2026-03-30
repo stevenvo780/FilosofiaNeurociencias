@@ -1,15 +1,9 @@
 """
-ESRGAN engine — dual-GPU batched inference with Tensor Cores FP16.
-
-Two modes:
-  process_frames()    — collect all results (needed for RIFE path)
-  process_streaming() — call on_frame(idx, np_array) per frame, zero accumulation
+ESRGAN engine — dual-GPU batched inference + CPU Multi-Thread inference.
 
 Key optimizations:
   - Double-buffered pinned memory: CPU preps batch N+1 while GPU runs batch N
-  - CPU prep OUTSIDE cuda stream so GPU never waits for memcpy
-  - Streaming mode: each batch piped to NVENC immediately, RAM = input + 1 batch
-  - No closure capture of frames list — passed as arg to prevent reference leaks
+  - CPU worker offloads chunks explicitly processing via `torch.set_num_threads`
 """
 import time, threading
 from pathlib import Path
@@ -50,7 +44,7 @@ class ESRGANEngine:
             self.models.append(net)
             self.streams.append(torch.cuda.Stream(device=dev))
 
-            # Warmup — trigger cuDNN autotuning & JIT caches
+            # Warmup
             dummy = torch.randn(bs, 3, 315, 560, device=dev, dtype=torch.float16)
             with torch.inference_mode():
                 _ = net(dummy)
@@ -61,19 +55,25 @@ class ESRGANEngine:
             vram = torch.cuda.memory_allocated(gid) / 1e9
             print(f"    warm  VRAM={vram:.2f}GB")
 
-    # ─────────────────────────────────────────────────────────
+        # Configure CPU inference
+        self.cpu_enabled = C.CPU_SHARE > 0.0
+        if self.cpu_enabled:
+            print(f"  [ESRGAN] CPU Worker (AMD Threads=16)  batch=1")
+            torch.set_num_threads(16)
+            m = spandrel.ModelLoader().load_from_file(C.ESRGAN_MODEL)
+            self.cpu_model = m.model.to("cpu").eval()
+            self.scale = m.scale
+            
+            dummy = torch.randn(1, 3, 315, 560, device="cpu", dtype=torch.float32)
+            with torch.inference_mode():
+                _ = self.cpu_model(dummy)
+            del dummy
+
     def _gpu_worker(self, gid: int, work_frames: list[np.ndarray],
                     base_idx: int, store: list | None,
                     on_frame: Callable | None,
                     counter: list, lock: threading.Lock,
                     total: int, t0: float):
-        """Process a slice of frames on one GPU.
-
-        Pipeline overlap strategy:
-          While GPU runs batch N+1, CPU delivers batch N results.
-          For streaming (on_frame): pass numpy view directly, no .copy().
-          For store mode (RIFE): .copy() runs overlapped with next GPU batch.
-        """
         torch = self.torch
         net = self.models[gid]
         dev = f"cuda:{gid}"
@@ -85,7 +85,6 @@ class ESRGANEngine:
 
         sample_h, sample_w = work_frames[0].shape[:2]
 
-        # Double-buffered pinned memory for H2D overlap
         pinned = [
             torch.empty(bs, sample_h, sample_w, 3,
                         dtype=torch.uint8, pin_memory=True),
@@ -93,14 +92,12 @@ class ESRGANEngine:
                         dtype=torch.uint8, pin_memory=True),
         ]
 
-        # Pre-fill first batch into pinned[0]
         first_n = min(bs, n)
         for i in range(first_n):
             pinned[0][i].copy_(torch.from_numpy(work_frames[i]))
 
         buf_idx = 0
         pos = 0
-        # Previous batch results waiting to be delivered
         prev_out_cpu = None
         prev_pos = 0
         prev_bs = 0
@@ -115,7 +112,6 @@ class ESRGANEngine:
             next_buf = 1 - buf_idx
             has_next = next_pos < n
 
-            # Launch GPU inference (async, returns immediately)
             with torch.cuda.stream(stream):
                 t_gpu = (pinned[cur_buf][:cur_bs]
                          .permute(0, 3, 1, 2)
@@ -132,9 +128,6 @@ class ESRGANEngine:
                 out_u8 = (out.clamp(0, 1) * 255).byte()
                 out_cpu = out_u8.permute(0, 2, 3, 1).cpu()
 
-            # ── OVERLAP ZONE: GPU runs current batch, CPU does these ──
-
-            # 1) Deliver PREVIOUS batch results (overlapped with GPU)
             if prev_out_cpu is not None:
                 out_np = prev_out_cpu.numpy()
                 for i in range(prev_bs):
@@ -142,7 +135,6 @@ class ESRGANEngine:
                     if store is not None:
                         store[gidx] = out_np[i].copy()
                     if on_frame is not None:
-                        # No .copy() — write view directly, discard after
                         on_frame(gidx, out_np[i])
                 del prev_out_cpu
                 prev_out_cpu = None
@@ -158,18 +150,14 @@ class ESRGANEngine:
                               f"{fps_now:.1f}fps  ETA {eta:.0f}s",
                               flush=True)
 
-            # 2) Prep NEXT batch into pinned (overlapped with GPU)
             if has_next:
                 next_n = min(bs, n - next_pos)
                 for i in range(next_n):
                     pinned[next_buf][i].copy_(
                         torch.from_numpy(work_frames[next_pos + i]))
 
-            # Wait for GPU to finish current batch
             torch.cuda.synchronize(gid)
 
-            # Stash current results — deliver them next iteration
-            # (while GPU runs the NEXT batch)
             prev_out_cpu = out_cpu
             prev_pos = pos
             prev_bs = cur_bs
@@ -179,7 +167,6 @@ class ESRGANEngine:
             buf_idx = next_buf
             pos = next_pos
 
-        # Deliver final batch results
         if prev_out_cpu is not None:
             out_np = prev_out_cpu.numpy()
             for i in range(prev_bs):
@@ -202,37 +189,94 @@ class ESRGANEngine:
 
         del pinned
 
-    # ─────────────────────────────────────────────────────────
-    def _run_dual(self, frames: list[np.ndarray],
-                  store: list | None,
-                  on_frame: Callable | None) -> int:
-        """Dispatch frames to dual-GPU workers. Returns processed count."""
+
+    def _cpu_worker(self, work_frames: list[np.ndarray],
+                    base_idx: int, store: list | None,
+                    on_frame: Callable | None,
+                    counter: list, lock: threading.Lock,
+                    total: int, t0: float):
+        """Process a slice of frames on CPU entirely, overlapping with GPU computation."""
+        torch = self.torch
+        net = self.cpu_model
+        n = len(work_frames)
+        if n == 0:
+            return
+
+        for pos in range(n):
+            if C.shutdown.is_set():
+                return
+            
+            frame = work_frames[pos]
+            t_cpu = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0).to("cpu", dtype=torch.float32) / 255.0
+
+            t_small = torch.nn.functional.interpolate(
+                t_cpu, scale_factor=0.5,
+                mode="bilinear", align_corners=False)
+
+            with torch.inference_mode():
+                out = net(t_small)
+
+            out_u8 = (out.clamp(0, 1) * 255).byte()
+            out_cpu_frame = out_u8[0].permute(1, 2, 0).numpy()
+
+            gidx = base_idx + pos
+            if store is not None:
+                store[gidx] = out_cpu_frame.copy()
+            if on_frame is not None:
+                on_frame(gidx, out_cpu_frame)
+
+            with lock:
+                counter[0] += 1
+                c = counter[0]
+                if c % 50 == 0 or c >= total:
+                    elapsed = time.time() - t0
+                    fps_now = c / elapsed if elapsed > 0 else 0
+                    eta = (total - c) / fps_now if fps_now > 0 else 0
+                    print(f"    ESRGAN {c}/{total}  "
+                          f"{fps_now:.1f}fps  ETA {eta:.0f}s",
+                          flush=True)
+            
+            del t_cpu, t_small, out, out_u8
+
+    def _run_parallel(self, frames: list[np.ndarray],
+                      store: list | None,
+                      on_frame: Callable | None) -> int:
+        """Dispatch frames to dual-GPU and CPU multi-thread workers."""
         total = len(frames)
         if total == 0:
             return 0
 
-        split = int(total * C.GPU0_SHARE) if self.ngpu > 1 else total
+        # Adjust indices according to user HW architecture and settings Configs
+        split0 = int(total * C.GPU0_SHARE)
+        split1 = split0 + int(total * C.GPU1_SHARE) if self.ngpu > 1 else split0
+
+        gpu0_frames = frames[:split0]
+        gpu1_frames = frames[split0:split1] if self.ngpu > 1 else []
+        cpu_frames = frames[split1:] if self.cpu_enabled else (frames[split0:] if self.ngpu == 1 else [])
+
         counter = [0]
         lock = threading.Lock()
         t0 = time.time()
-
-        # Pass frame slices as explicit args — no closure capture
-        gpu0_frames = frames[:split]
-        gpu1_frames = frames[split:] if self.ngpu > 1 else []
 
         threads = []
         if gpu0_frames:
             t = threading.Thread(
                 target=self._gpu_worker,
-                args=(0, gpu0_frames, 0, store, on_frame,
-                      counter, lock, total, t0))
+                args=(0, gpu0_frames, 0, store, on_frame, counter, lock, total, t0))
             t.start()
             threads.append(t)
+            
         if gpu1_frames:
             t = threading.Thread(
                 target=self._gpu_worker,
-                args=(1, gpu1_frames, split, store, on_frame,
-                      counter, lock, total, t0))
+                args=(1, gpu1_frames, split0, store, on_frame, counter, lock, total, t0))
+            t.start()
+            threads.append(t)
+            
+        if self.cpu_enabled and cpu_frames:
+            t = threading.Thread(
+                target=self._cpu_worker,
+                args=(cpu_frames, split1 if self.ngpu > 1 else split0, store, on_frame, counter, lock, total, t0))
             t.start()
             threads.append(t)
 
@@ -245,17 +289,11 @@ class ESRGANEngine:
               f"{elapsed:.0f}s  {c/elapsed:.1f}fps", flush=True)
         return c
 
-    # ─────────────────────────────────────────────────────────
     def process_frames(self, frames: list[np.ndarray],
                        out_dir: Path | None = None) -> list[np.ndarray]:
-        """Collect all results in RAM. Use for RIFE path (needs all frames).
-
-        Returns:
-            list of enhanced HWC uint8 RGB numpy arrays
-        """
         total = len(frames)
         results = [None] * total
-        self._run_dual(frames, store=results, on_frame=None)
+        self._run_parallel(frames, store=results, on_frame=None)
 
         if out_dir is not None:
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -273,16 +311,6 @@ class ESRGANEngine:
 
         return results
 
-    # ─────────────────────────────────────────────────────────
     def process_streaming(self, frames: list[np.ndarray],
                           on_frame: Callable[[int, np.ndarray], None]) -> int:
-        """Stream results via callback — zero accumulation in RAM.
-
-        on_frame(global_idx, rgb_uint8_hwc) is called per frame as produced.
-        Frames arrive out of order (GPU0 and GPU1 run in parallel).
-        Caller must handle ordering if sequential output is needed.
-
-        Returns:
-            number of frames processed
-        """
-        return self._run_dual(frames, store=None, on_frame=on_frame)
+        return self._run_parallel(frames, store=None, on_frame=on_frame)

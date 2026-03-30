@@ -15,7 +15,7 @@ def interpolate(in_dir: Path, out_dir: Path) -> int:
         C.RIFE_BIN,
         "-i", str(in_dir), "-o", str(out_dir),
         "-m", C.RIFE_MODEL_DIR,
-        "-g", "0,1", "-j", C.RIFE_GPU_STR,
+        "-g", "0,1", "-j", "4:4",
         "-f", "%08d.png",
     ]
     subprocess.run(cmd, check=True)
