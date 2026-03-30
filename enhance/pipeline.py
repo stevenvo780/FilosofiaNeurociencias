@@ -127,8 +127,8 @@ def _open_nvenc_pipe(out_file: Path, w: int, h: int, fps: float,
         "-s", f"{w}x{h}", "-r", str(fps),
         "-i", "pipe:0",
         "-c:v", "hevc_nvenc", "-gpu", str(gpu),
-        "-preset", "p6", "-tune", "hq",
-        "-rc", "vbr", "-cq", "20",
+        "-preset", "p1",
+        "-rc", "vbr", "-cq", "22",
         "-b:v", "12M", "-maxrate", "18M", "-bufsize", "24M",
         "-profile:v", "main10", "-pix_fmt", "p010le",
         str(out_file), "-loglevel", "warning",
@@ -205,10 +205,13 @@ def extract_worker(chunks, src: Path, w: int, h: int, do_esr: bool, prog: Progre
     out_q.put(None)
 
 
-def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool, fps: float, 
-                  work: Path, prog: Progress, out_w: int, out_h: int, 
-                  in_q: queue.Queue, out_q: queue.Queue):
-    """Stage 2: Enhances structures asynchronously utilizing 2x GPUs via local streaming pipes or memory blocks."""
+def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
+                      in_q: queue.Queue, out_q: queue.Queue):
+    """Stage 2 (NEW ORDER): RIFE interpolation at ORIGINAL resolution (1260p, 3.8x faster than 4K).
+    
+    Receives raw extracted frames, writes them as PNGs, runs RIFE Vulkan, 
+    reads interpolated frames back into RAM, and passes downstream to ESRGAN.
+    """
     while True:
         item = in_q.get()
         if item is None:
@@ -222,60 +225,57 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool, fps: fl
             out_q.put((cid, None))
             continue
 
-        if do_rife:
-            esr_frames = None
-            if do_esr and esr and not prog.done(cid, "esrgan"):
-                esr_frames = esr.process_frames(frames, out_dir=None)
-                prog.mark(cid, "esrgan")
-            
-            src_frames = esr_frames if esr_frames is not None else frames
-            out_q.put((cid, src_frames))
-            del src_frames, esr_frames, frames
-            gc.collect()
+        if not do_rife:
+            # Pass through — no interpolation
+            out_q.put((cid, frames))
+            continue
 
-        else:
-            # Streaming path
-            disk_dir = work / f"chunk_{cid:04d}"
-            vid = disk_dir / "output.mp4"
-            if do_esr and esr and not prog.done(cid, "esrgan"):
-                n = len(frames)
-                proc = _open_nvenc_pipe(vid, out_w, out_h, fps, C.NVENC_GPU)
-                writer = _ReorderWriter(proc.stdin, n)
-                t0 = time.time()
-                esr.process_streaming(frames, writer.on_frame)
-                writer.flush_remaining()
-                try: proc.stdin.close()
-                except: pass
-                proc.wait()
-                dt = time.time() - t0
-                if proc.returncode == 0:
-                    prog.mark(cid, "esrgan")
-                    prog.mark(cid, "encode")
-                    prog.mark(cid, "clean")
-                    print(f"  [Stream] chunk {cid:04d}: {writer.written}/{n} frames → NVENC  ({dt:.1f}s, {n/dt:.1f}fps)", flush=True)
-            elif not do_esr:
-                n = len(frames)
-                proc = _open_nvenc_pipe(vid, out_w, out_h, fps, C.NVENC_GPU)
-                t0 = time.time()
-                for f in frames:
-                    proc.stdin.write(memoryview(np.ascontiguousarray(f)))
-                try: proc.stdin.close()
-                except: pass
-                proc.wait()
-                dt = time.time() - t0
-                if proc.returncode == 0:
-                    prog.mark(cid, "encode")
-                    prog.mark(cid, "clean")
-                    print(f"  [Encode] chunk {cid:04d}: {n} frames ({dt:.1f}s)", flush=True)
-            
+        rife_in = _tmpfs_chunk(cid) / "raw"
+        rife_out = _tmpfs_chunk(cid) / "rife"
+
+        if not prog.done(cid, "rife"):
+            # Write original-resolution frames as PNGs
+            _write_pngs(frames, rife_in)
             del frames
             gc.collect()
-            out_q.put((cid, None))
+            
+            tr = time.time()
+            n = rife_interpolate(rife_in, rife_out)
+            prog.mark(cid, "rife")
+            dt = time.time() - tr
+            print(f"  | RIFE (1260p): {n} frames  ({dt:.1f}s, {n/dt:.1f}fps) chunk {cid:04d}", flush=True)
+            shutil.rmtree(rife_in, ignore_errors=True)
+        else:
+            del frames
+            gc.collect()
+
+        # Read interpolated frames back into RAM for ESRGAN
+        from concurrent.futures import ThreadPoolExecutor
+        png_files = sorted(rife_out.glob("*.png"))
+        
+        def _read_png(p):
+            img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else None
+        
+        with ThreadPoolExecutor(max_workers=C.READ_WORKERS) as pool:
+            interp_frames = list(pool.map(_read_png, png_files))
+        interp_frames = [f for f in interp_frames if f is not None]
+        
+        # Cleanup RIFE tmpfs
+        shutil.rmtree(_tmpfs_chunk(cid), ignore_errors=True)
+        
+        out_q.put((cid, interp_frames))
 
 
-def rife_worker(do_rife: bool, fps: float, work: Path, prog: Progress,
-               in_q: queue.Queue, total: int, done_n: int, t_start: float):
-    """Stage 3: Manages local file dumps, frame interpolations internally mapping Vulkan allocations, and hard MP4 encodings."""
+def esrgan_encode_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
+                         fps: float, work: Path, prog: Progress,
+                         out_w: int, out_h: int,
+                         in_q: queue.Queue, total: int, done_n: int, t_start: float):
+    """Stage 3 (NEW ORDER): ESRGAN upscale + NVENC encode.
+    
+    Receives interpolated frames (2x count at 1260p if RIFE ran),
+    upscales them with ESRGAN dual-GPU, then encodes with NVENC.
+    """
     completed = done_n
     while True:
         item = in_q.get()
@@ -285,7 +285,7 @@ def rife_worker(do_rife: bool, fps: float, work: Path, prog: Progress,
             continue
             
         cid, frames = item
-        if frames is None or prog.done(cid, "encode") or not do_rife:
+        if frames is None or prog.done(cid, "encode"):
             if frames is not None:
                 del frames
                 gc.collect()
@@ -296,40 +296,57 @@ def rife_worker(do_rife: bool, fps: float, work: Path, prog: Progress,
             print(f"  | Progress: {completed}/{total} ({100*completed/total:.1f}%)  ETA {rem/3600:.1f}h\n", flush=True)
             continue
 
-        rife_in = _tmpfs_chunk(cid) / "esrgan"
-        rife_out = _tmpfs_chunk(cid) / "rife"
         disk_dir = work / f"chunk_{cid:04d}"
         vid = disk_dir / "output.mp4"
+        disk_dir.mkdir(parents=True, exist_ok=True)
 
-        if not prog.done(cid, "rife"):
-            _write_pngs(frames, rife_in)
+        out_fps = fps * 2 if do_rife else fps
+        n = len(frames)
+
+        if do_esr and esr and not prog.done(cid, "esrgan"):
+            # BATCH mode: GPU runs at full speed, then encode separately
+            t0 = time.time()
+            esr_frames = esr.process_frames(frames, out_dir=None)
+            dt_esr = time.time() - t0
+            prog.mark(cid, "esrgan")
+            print(f"  [ESRGAN] chunk {cid:04d}: {n} frames ({dt_esr:.1f}s, {n/dt_esr:.1f}fps)", flush=True)
             del frames
-            gc.collect()
             
-            tr = time.time()
-            n = rife_interpolate(rife_in, rife_out)
-            prog.mark(cid, "rife")
-            print(f"  | RIFE:   {n} frames  ({time.time()-tr:.1f}s) chunk {cid:04d}", flush=True)
-            shutil.rmtree(rife_in, ignore_errors=True)
-        else:
-            if frames is not None:
-                del frames
-                gc.collect()
-
-        out_fps = fps * 2
-        if not prog.done(cid, "encode"):
-            disk_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                t0 = time.time()
-                nvenc_encode(rife_out, vid, out_fps)
+            # Encode all upscaled frames to NVENC
+            t0 = time.time()
+            proc = _open_nvenc_pipe(vid, out_w, out_h, out_fps, C.NVENC_GPU)
+            for f in esr_frames:
+                if f is not None:
+                    proc.stdin.write(memoryview(np.ascontiguousarray(f)))
+            try: proc.stdin.close()
+            except: pass
+            proc.wait()
+            dt_enc = time.time() - t0
+            del esr_frames
+            if proc.returncode == 0:
                 prog.mark(cid, "encode")
-                print(f"  [NVENC] chunk {cid:04d} encoded ({time.time()-t0:.1f}s)", flush=True)
-            except Exception as e:
-                print(f"  [!] Encode chunk {cid:04d} failed: {e}")
+                prog.mark(cid, "clean")
+                print(f"  [NVENC] chunk {cid:04d}: {n} frames ({dt_enc:.1f}s, {n/dt_enc:.1f}fps)", flush=True)
+        else:
+            # No ESRGAN — encode raw frames
+            proc = _open_nvenc_pipe(vid, frames[0].shape[1], frames[0].shape[0], out_fps, C.NVENC_GPU)
+            t0 = time.time()
+            for f in frames:
+                proc.stdin.write(memoryview(np.ascontiguousarray(f)))
+            try: proc.stdin.close()
+            except: pass
+            proc.wait()
+            dt = time.time() - t0
+            if proc.returncode == 0:
+                prog.mark(cid, "encode")
+                prog.mark(cid, "clean")
+                print(f"  [Encode] chunk {cid:04d}: {n} frames ({dt:.1f}s)", flush=True)
 
-        if vid.exists() and vid.stat().st_size > 1000:
-            shutil.rmtree(_tmpfs_chunk(cid), ignore_errors=True)
-            prog.mark(cid, "clean")
+        try:
+            del frames
+        except (UnboundLocalError, NameError):
+            pass
+        gc.collect()
 
         completed += 1
         wall = time.time() - t_start
@@ -341,7 +358,11 @@ def rife_worker(do_rife: bool, fps: float, work: Path, prog: Progress,
 def run(chunks, src: Path, work: Path, prog: Progress,
         do_esr: bool, do_rife: bool, fps: float,
         esr: ESRGANEngine | None, w: int = 2240, h: int = 1260):
-    """Spins up concurrent overlapping pipeline stages interconnected by capacity-capped Queues."""
+    """Pipeline: Extract → RIFE(1260p) → ESRGAN+NVENC(4K).
+    
+    RIFE runs at original resolution (3.8x faster than 4K) then 
+    ESRGAN upscales interpolated frames and streams directly to NVENC.
+    """
     total = len(chunks)
     done_n = sum(1 for c in chunks if prog.done(c[0], "encode"))
     pending = [c for c in chunks if not prog.done(c[0], "encode")]
@@ -355,9 +376,9 @@ def run(chunks, src: Path, work: Path, prog: Progress,
     out_w = w * 2 if do_esr else w
     out_h = h * 2 if do_esr else h
     
-    # maxsize=1 pushes active backpressure: Threads wait if upstream finishes too quickly
+    # maxsize=1 pushes active backpressure
     q_extract = queue.Queue(maxsize=1)
-    q_esrgan  = queue.Queue(maxsize=1)
+    q_rife    = queue.Queue(maxsize=1)
 
     t_start = time.time()
 
@@ -366,24 +387,25 @@ def run(chunks, src: Path, work: Path, prog: Progress,
         args=(pending, src, w, h, do_esr, prog, q_extract),
         name="Extractor Thread"
     )
-    t_esr = threading.Thread(
-        target=esrgan_worker,
-        args=(esr, do_esr, do_rife, fps, work, prog, out_w, out_h, q_extract, q_esrgan),
-        name="ESRGAN Engine Thread"
-    )
     t_rife = threading.Thread(
-        target=rife_worker,
-        args=(do_rife, fps, work, prog, q_esrgan, total, done_n, t_start),
-        name="RIFE & Encode Subprocessor"
+        target=rife_first_worker,
+        args=(do_rife, fps, prog, q_extract, q_rife),
+        name="RIFE Interpolator (1260p)"
+    )
+    t_esr = threading.Thread(
+        target=esrgan_encode_worker,
+        args=(esr, do_esr, do_rife, fps, work, prog, out_w, out_h,
+              q_rife, total, done_n, t_start),
+        name="ESRGAN+NVENC Thread"
     )
 
     t_ext.start()
-    t_esr.start()
     t_rife.start()
+    t_esr.start()
 
     t_ext.join()
-    t_esr.join()
     t_rife.join()
+    t_esr.join()
 
     # Recalculate done chunks post-execution
     done_n = sum(1 for c in chunks if prog.done(c[0], "encode"))

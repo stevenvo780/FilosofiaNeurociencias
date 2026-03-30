@@ -69,8 +69,8 @@ def main():
     chunks = []
     s = 0.0
     i = 0
-    while s < min(dur, 60.0):
-        cd = min(args.chunk, min(dur, 60.0) - s)
+    while s < dur:
+        cd = min(args.chunk, dur - s)
         if cd <= 0:
             break
         chunks.append((i, s, cd))
