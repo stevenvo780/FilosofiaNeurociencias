@@ -95,23 +95,40 @@ def run(chunks, src: Path, work: Path, prog: Progress,
             item = enc_q.get()
             if item is None:
                 break
-            cid, frames_dir, out_fps = item
-            disk_dir = work / f"chunk_{cid:04d}"
-            disk_dir.mkdir(parents=True, exist_ok=True)
-            vid = disk_dir / "output.mp4"
-            if not prog.done(cid, "encode"):
-                try:
-                    t0 = time.time()
-                    nvenc_encode(frames_dir, vid, out_fps)
-                    prog.mark(cid, "encode")
-                    print(f"  [NVENC] chunk {cid:04d} encoded ({time.time()-t0:.1f}s)",
-                          flush=True)
-                except Exception as e:
-                    print(f"  [!] Encode chunk {cid:04d} failed: {e}")
-            tmp_chunk = _tmpfs_chunk(cid)
-            if vid.exists() and vid.stat().st_size > 1000:
-                shutil.rmtree(tmp_chunk, ignore_errors=True)
-                prog.mark(cid, "clean")
+            if len(item) == 3:
+                # PNG dir-based (from RIFE)
+                cid, frames_dir, out_fps = item
+                disk_dir = work / f"chunk_{cid:04d}"
+                disk_dir.mkdir(parents=True, exist_ok=True)
+                vid = disk_dir / "output.mp4"
+                if not prog.done(cid, "encode"):
+                    try:
+                        t0 = time.time()
+                        nvenc_encode(frames_dir, vid, out_fps)
+                        prog.mark(cid, "encode")
+                        print(f"  [NVENC] chunk {cid:04d} encoded ({time.time()-t0:.1f}s)",
+                              flush=True)
+                    except Exception as e:
+                        print(f"  [!] Encode chunk {cid:04d} failed: {e}")
+                tmp_chunk = _tmpfs_chunk(cid)
+                if vid.exists() and vid.stat().st_size > 1000:
+                    shutil.rmtree(tmp_chunk, ignore_errors=True)
+                    prog.mark(cid, "clean")
+            else:
+                # Numpy pipe-based (zero PNG)
+                cid, np_frames, out_fps, vid = item
+                vid.parent.mkdir(parents=True, exist_ok=True)
+                if not prog.done(cid, "encode"):
+                    try:
+                        t0 = time.time()
+                        _encode_from_numpy(np_frames, vid, out_fps, C.NVENC_GPU)
+                        prog.mark(cid, "encode")
+                        prog.mark(cid, "clean")
+                        print(f"  [NVENC] chunk {cid:04d} pipe-encoded ({time.time()-t0:.1f}s)",
+                              flush=True)
+                    except Exception as e:
+                        print(f"  [!] Encode chunk {cid:04d} failed: {e}")
+                del np_frames
             enc_q.task_done()
 
     enc_thread = threading.Thread(target=_encoder, daemon=True, name="encoder")
@@ -182,20 +199,15 @@ def run(chunks, src: Path, work: Path, prog: Progress,
             # Encode from PNG dir (RIFE output)
             enc_q.put((cid, rife_out, out_fps))
         else:
-            # ── Stage 4: NVENC — pipe numpy directly (ZERO PNG!) ──
+            # ── Stage 4: NVENC — pipe numpy in background thread ──
             disk_dir = work / f"chunk_{cid:04d}"
             vid = disk_dir / "output.mp4"
             if not prog.done(cid, "encode"):
                 src_frames = esr_frames if esr_frames is not None else frames
                 if src_frames is not None:
-                    t0 = time.time()
-                    _encode_from_numpy(src_frames, vid, fps, C.NVENC_GPU)
-                    prog.mark(cid, "encode")
-                    prog.mark(cid, "clean")
-                    print(f"  [NVENC] chunk {cid:04d} encoded ({time.time()-t0:.1f}s)",
-                          flush=True)
-                    del src_frames
-            # Free any remaining
+                    # Queue encode to run in background while next chunk processes
+                    enc_q.put((cid, src_frames, fps, vid))
+            # Free references (data owned by enc_q now)
             del esr_frames, frames
 
         completed += 1

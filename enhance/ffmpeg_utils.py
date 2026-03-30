@@ -39,7 +39,7 @@ def extract_frames_to_ram(src: Path, start: float, dur: float,
         raw = proc.stdout.read(frame_bytes)
         if len(raw) < frame_bytes:
             break
-        frames.append(np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3))
+        frames.append(np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3).copy())
     proc.wait()
     return frames
 
