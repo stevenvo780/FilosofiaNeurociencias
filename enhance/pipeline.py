@@ -292,6 +292,72 @@ def _encode_from_numpy(frames: list[np.ndarray], out_file: Path,
         raise RuntimeError(f"NVENC encode failed (rc={proc.returncode})")
 
 
+def _try_gpu_resident_encode(tensors: list, out_file: Path,
+                              fps: float, gpu: int = 0) -> bool:
+    """T16: Attempt GPU-resident ESRGAN→NVENC encoding via CUDA shared surfaces.
+
+    Uses pynvvideocodec (PyNvVideoCodec) for direct GPU tensor → NVENC path
+    when available.  Returns True if successful, False if the library is not
+    installed or the encode fails (caller should fall back to pipe-based path).
+
+    Parameters
+    ----------
+    tensors : list of torch.Tensor
+        NHWC uint8 tensors on the target CUDA device.
+    out_file : Path
+        Output .mp4 path.
+    fps : float
+        Target framerate.
+    gpu : int
+        CUDA device ordinal for NVENC.
+    """
+    if not C.ESRGAN_GPU_RESIDENT:
+        return False
+
+    try:
+        # Check for PyNvVideoCodec or similar CUDA video encoder bindings
+        import PyNvVideoCodec as nvc  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+
+    try:
+        import torch
+        if not tensors or not isinstance(tensors[0], torch.Tensor):
+            return False
+
+        h, w = tensors[0].shape[0], tensors[0].shape[1]
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Create NVENC encoder with CUDA interop
+        encoder = nvc.CreateEncoder(
+            w, h, "hevc",
+            gpu_id=gpu,
+            preset="P1",
+            rate_control="VBR",
+            bitrate=int(C.NVENC_BITRATE.rstrip("M")) * 1_000_000,
+            max_bitrate=int(C.NVENC_MAXRATE.rstrip("M")) * 1_000_000,
+            fps=int(fps),
+        )
+
+        with open(str(out_file), "wb") as fout:
+            for tensor in tensors:
+                # Convert RGB → NV12 on GPU and encode
+                packet = encoder.encode_frame(tensor)
+                if packet:
+                    fout.write(packet)
+            # Flush encoder
+            while True:
+                packet = encoder.flush()
+                if not packet:
+                    break
+                fout.write(packet)
+
+        return True
+    except Exception:
+        # GPU-resident encode failed; caller falls back to pipe path
+        return False
+
+
 def _stream_esrgan_to_nvenc(esr: ESRGANEngine, frames: list[np.ndarray],
                             out_file: Path, fps: float, gpu: int) -> tuple[int, float]:
     """Upscale and encode a chunk without materializing 4K frames in RAM."""

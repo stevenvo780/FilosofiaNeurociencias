@@ -102,6 +102,15 @@ ESRGAN_D2H_DOUBLE_BUFFER = (
     os.getenv("ENHANCE_ESRGAN_D2H_DOUBLE_BUFFER", "1") == "1"
 )
 
+# T16: GPU-resident pipeline — keep ESRGAN output tensors on GPU and attempt
+# direct CUDA→NVENC transfer via shared surfaces.  Experimental: requires
+# pynvvideocodec or compatible CUDA video encoder bindings.
+# When enabled and the required libraries are not available, falls back to the
+# standard pinned-memory D2H path transparently.
+ESRGAN_GPU_RESIDENT = (
+    os.getenv("ENHANCE_ESRGAN_GPU_RESIDENT", "0") == "1"
+)
+
 NVENC_PRESET = os.getenv("ENHANCE_NVENC_PRESET", "p1")
 NVENC_CQ = os.getenv("ENHANCE_NVENC_CQ", "19")
 NVENC_BITRATE = os.getenv("ENHANCE_NVENC_BITRATE", "20M")
