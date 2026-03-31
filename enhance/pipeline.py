@@ -135,10 +135,10 @@ def _open_nvenc_pipe(out_file: Path, w: int, h: int, fps: float,
     ]
     frame_bytes = w * h * 3
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                            bufsize=frame_bytes * 8)
+                            bufsize=frame_bytes * 16)
     try:
         F_SETPIPE_SZ = 1031
-        fcntl.fcntl(proc.stdin.fileno(), F_SETPIPE_SZ, 1 << 20)  # 1 MB
+        fcntl.fcntl(proc.stdin.fileno(), F_SETPIPE_SZ, 1 << 24)  # 16 MB pipe
     except OSError:
         pass
     return proc
@@ -304,7 +304,8 @@ def esrgan_encode_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
         n = len(frames)
 
         if do_esr and esr and not prog.done(cid, "esrgan"):
-            # BATCH mode: GPU runs at full speed, then encode separately
+            # BATCH mode: GPU runs at full speed, then encode sequentially
+            # (.copy() ensures contiguous frames for fast pipe writes)
             t0 = time.time()
             esr_frames = esr.process_frames(frames, out_dir=None)
             dt_esr = time.time() - t0
@@ -312,12 +313,12 @@ def esrgan_encode_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
             print(f"  [ESRGAN] chunk {cid:04d}: {n} frames ({dt_esr:.1f}s, {n/dt_esr:.1f}fps)", flush=True)
             del frames
             
-            # Encode all upscaled frames to NVENC
+            # Encode all upscaled frames to NVENC (fast with contiguous data)
             t0 = time.time()
             proc = _open_nvenc_pipe(vid, out_w, out_h, out_fps, C.NVENC_GPU)
             for f in esr_frames:
                 if f is not None:
-                    proc.stdin.write(memoryview(np.ascontiguousarray(f)))
+                    proc.stdin.write(memoryview(f))
             try: proc.stdin.close()
             except: pass
             proc.wait()

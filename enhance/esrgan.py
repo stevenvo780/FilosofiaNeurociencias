@@ -122,14 +122,15 @@ class ESRGANEngine:
                     out = net(t_small)
 
                 out_u8 = (out.clamp(0, 1) * 255).byte()
-                out_cpu = out_u8.permute(0, 2, 3, 1).cpu()
+                # .contiguous() on GPU is ~5x faster than .copy() on CPU
+                out_cpu = out_u8.permute(0, 2, 3, 1).contiguous().cpu()
 
             if prev_out_cpu is not None:
                 out_np = prev_out_cpu.numpy()
                 for i in range(prev_bs):
                     gidx = prev_start + i
                     if store is not None:
-                        store[gidx] = out_np[i]
+                        store[gidx] = out_np[i]  # already contiguous from GPU
                     if on_frame is not None:
                         on_frame(gidx, out_np[i])
                 del prev_out_cpu
@@ -289,16 +290,18 @@ class ESRGANEngine:
         return c
 
     def process_frames(self, frames: list[np.ndarray],
-                       out_dir: Path | None = None) -> list[np.ndarray]:
+                       out_dir: Path | None = None,
+                       store: list | None = None) -> list[np.ndarray]:
         total = len(frames)
-        results = [None] * total
-        self._run_parallel(frames, store=results, on_frame=None)
+        if store is None:
+            store = [None] * total
+        self._run_parallel(frames, store=store, on_frame=None)
 
         if out_dir is not None:
             out_dir.mkdir(parents=True, exist_ok=True)
             pool = ThreadPoolExecutor(max_workers=C.WRITE_WORKERS)
             futs = []
-            for i, img in enumerate(results):
+            for i, img in enumerate(store):
                 if img is not None:
                     dst = out_dir / f"{i+1:08d}.png"
                     futs.append(pool.submit(
@@ -308,7 +311,7 @@ class ESRGANEngine:
                 f.result()
             pool.shutdown(wait=False)
 
-        return results
+        return store
 
     def process_streaming(self, frames: list[np.ndarray],
                           on_frame: Callable[[int, np.ndarray], None]) -> int:

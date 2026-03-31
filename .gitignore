@@ -4,3 +4,4 @@ enhanced/
 */__pycache__/
 __pycache__/
 *.pyc*
+videos/*
