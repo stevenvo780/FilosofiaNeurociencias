@@ -376,9 +376,9 @@ def run(chunks, src: Path, work: Path, prog: Progress,
     out_w = w * 2 if do_esr else w
     out_h = h * 2 if do_esr else h
     
-    # maxsize=1 pushes active backpressure
-    q_extract = queue.Queue(maxsize=1)
-    q_rife    = queue.Queue(maxsize=1)
+    # maxsize=2 allows pipelining: RIFE chunk N+1 overlaps with ESRGAN chunk N
+    q_extract = queue.Queue(maxsize=2)
+    q_rife    = queue.Queue(maxsize=2)
 
     t_start = time.time()
 

@@ -90,8 +90,9 @@ class ESRGANEngine:
         ]
 
         cur_bs = end - start
-        for i in range(cur_bs):
-            pinned[0][i].copy_(torch.from_numpy(frames[start + i]))
+        # Bulk copy: stack all frames at once, then single copy_ into pinned buffer
+        pinned[0][:cur_bs].copy_(torch.from_numpy(
+            np.stack([frames[start + i] for i in range(cur_bs)])))
             
         buf_idx = 0
         prev_out_cpu = None
@@ -128,7 +129,7 @@ class ESRGANEngine:
                 for i in range(prev_bs):
                     gidx = prev_start + i
                     if store is not None:
-                        store[gidx] = out_np[i].copy() # explicit random access memory insertion
+                        store[gidx] = out_np[i]
                     if on_frame is not None:
                         on_frame(gidx, out_np[i])
                 del prev_out_cpu
@@ -145,10 +146,10 @@ class ESRGANEngine:
                               f"{fps_now:.1f}fps  ETA {eta:.0f}s",
                               flush=True)
 
+            # Bulk copy next batch while GPU works (overlapped via CUDA stream)
             if next_bs > 0:
-                for i in range(next_bs):
-                    pinned[next_buf][i].copy_(
-                        torch.from_numpy(frames[next_start + i]))
+                pinned[next_buf][:next_bs].copy_(torch.from_numpy(
+                    np.stack([frames[next_start + i] for i in range(next_bs)])))
 
             torch.cuda.synchronize(gid)
 

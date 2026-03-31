@@ -1,0 +1,57 @@
+============================================================
+  AI VIDEO ENHANCEMENT
+============================================================
+  Input:  test_trim.mp4  (0.0h, 2240x1260 @ 25.0fps)
+  Output: test_trim_ai_50fps.mp4  (4480x2520 @ 50.0fps)
+  Frames: ~375  |  Chunks: 30s each
+  ESRGAN: ON  |  RIFE: ON
+  Tmpfs:  /tmp/enhance_work  (frames in RAM, zero disk I/O)
+============================================================
+
+  1 chunks total, 0 done, 1 remaining
+
+  [ESRGAN] GPU0 NVIDIA GeForce RTX 5070 Ti  batch=8
+    warm  VRAM=0.14GB
+  [ESRGAN] GPU1 NVIDIA GeForce RTX 2060  batch=4
+    warm  VRAM=0.07GB
+
+  == Chunk 0000  [0s–15s] ==
+  [Extract] chunk 0000: 375 frames (1.6s, 234fps)
+[0 NVIDIA GeForce RTX 5070 Ti]  queueC=2[8]  queueG=0[16]  queueT=1[2]
+[0 NVIDIA GeForce RTX 5070 Ti]  bugsbn1=0  bugbilz=0  bugcopc=0  bugihfa=0
+[0 NVIDIA GeForce RTX 5070 Ti]  fp16-p/s/a=1/1/1  int8-p/s/a=1/1/1
+[0 NVIDIA GeForce RTX 5070 Ti]  subgroup=32  basic=1  vote=1  ballot=1  shuffle=1
+[1 NVIDIA GeForce RTX 2060]  queueC=2[8]  queueG=0[16]  queueT=1[2]
+[1 NVIDIA GeForce RTX 2060]  bugsbn1=0  bugbilz=0  bugcopc=0  bugihfa=0
+[1 NVIDIA GeForce RTX 2060]  fp16-p/s/a=1/1/1  int8-p/s/a=1/1/1
+[1 NVIDIA GeForce RTX 2060]  subgroup=32  basic=1  vote=1  ballot=1  shuffle=1
+[2 llvmpipe (LLVM 20.1.8, 256 bits)]  queueC=0[1]  queueG=0[1]  queueT=0[1]
+[2 llvmpipe (LLVM 20.1.8, 256 bits)]  bugsbn1=0  bugbilz=0  bugcopc=0  bugihfa=0
+[2 llvmpipe (LLVM 20.1.8, 256 bits)]  fp16-p/s/a=1/1/1  int8-p/s/a=1/1/1
+[2 llvmpipe (LLVM 20.1.8, 256 bits)]  subgroup=8  basic=1  vote=1  ballot=1  shuffle=1
+  | RIFE (1260p): 750 frames  (34.5s, 21.7fps) chunk 0000
+    ESRGAN 52/750  21.1fps  ETA 33s
+    ESRGAN 100/750  28.3fps  ETA 23s
+    ESRGAN 152/750  31.7fps  ETA 19s
+    ESRGAN 204/750  33.3fps  ETA 16s
+    ESRGAN 256/750  34.3fps  ETA 14s
+    ESRGAN 300/750  35.1fps  ETA 13s
+    ESRGAN 352/750  35.6fps  ETA 11s
+    ESRGAN 404/750  36.1fps  ETA 10s
+    ESRGAN 456/750  36.5fps  ETA 8s
+    ESRGAN 500/750  36.7fps  ETA 7s
+    ESRGAN 552/750  37.0fps  ETA 5s
+    ESRGAN 600/750  37.1fps  ETA 4s
+    ESRGAN 656/750  37.6fps  ETA 3s
+    ESRGAN 700/750  37.3fps  ETA 1s
+    ESRGAN 736/750  37.3fps  ETA 0s
+    ESRGAN 750/750  36.5fps  ETA 0s
+    ESRGAN done: 750 frames  21s  36.5fps
+  [ESRGAN] chunk 0000: 750 frames (20.5s, 36.5fps)
+  [NVENC] chunk 0000: 750 frames (35.8s, 21.0fps)
+  | Progress: 1/1 (100.0%)  ETA 0.0h
+
+
+  Processing: 0.0h  (0.15x realtime)
+
+[DONE] /home/stev/Descargas/FilosofiaNeurociencias/enhanced/test_trim_ai_50fps.mp4  (0.58 GB)
