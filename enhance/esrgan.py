@@ -108,7 +108,8 @@ class ESRGANEngine:
     def _gpu_worker(self, worker_idx: int, dev_id: int,
                     frames: list[np.ndarray], get_batch: Callable,
                     store: list | None, on_frame: Callable | None,
-                    counter: list, lock: threading.Lock, total: int, t0: float):
+                    counter: list, lock: threading.Lock, total: int, t0: float,
+                    log_progress: bool):
         torch = self.torch
         net = self.models[worker_idx]
         dev = f"cuda:{dev_id}"
@@ -155,7 +156,7 @@ class ESRGANEngine:
             with lock:
                 counter[0] += cur_bs
                 c = counter[0]
-                if c % 50 < bs or c >= total:
+                if log_progress and (c % 50 < bs or c >= total):
                     elapsed = time.time() - t0
                     fps_now = c / elapsed if elapsed > 0 else 0
                     eta = (total - c) / fps_now if fps_now > 0 else 0
@@ -166,7 +167,8 @@ class ESRGANEngine:
 
     def _cpu_worker(self, frames: list[np.ndarray], get_batch: Callable,
                     store: list | None, on_frame: Callable | None,
-                    counter: list, lock: threading.Lock, total: int, t0: float):
+                    counter: list, lock: threading.Lock, total: int, t0: float,
+                    log_progress: bool):
         torch = self.torch
         net = self.cpu_model
 
@@ -199,7 +201,7 @@ class ESRGANEngine:
             with lock:
                 counter[0] += 1
                 c = counter[0]
-                if c % 50 == 0 or c >= total:
+                if log_progress and (c % 50 == 0 or c >= total):
                     elapsed = time.time() - t0
                     fps_now = c / elapsed if elapsed > 0 else 0
                     eta = (total - c) / fps_now if fps_now > 0 else 0
@@ -211,7 +213,8 @@ class ESRGANEngine:
 
     def _run_parallel(self, frames: list[np.ndarray],
                       store: list | None,
-                      on_frame: Callable | None) -> int:
+                      on_frame: Callable | None,
+                      log_progress: bool = True) -> int:
         """Dispatch dynamically fetching threads."""
         total = len(frames)
         if total == 0:
@@ -259,6 +262,7 @@ class ESRGANEngine:
             lock,
             total,
             t0,
+            log_progress,
         )
         
         # Deploy fetching worker for GPU1 (Slightly Slower: Pulls 4 frames automatically)
@@ -275,11 +279,23 @@ class ESRGANEngine:
                 lock,
                 total,
                 t0,
+                log_progress,
             )
             
         # Deploy fetching worker for CPU (R9 Processor: Pulls 1 frame slowly behind them)
         if self.cpu_enabled:
-            launch(self._cpu_worker, frames, get_batch, store, on_frame, counter, lock, total, t0)
+            launch(
+                self._cpu_worker,
+                frames,
+                get_batch,
+                store,
+                on_frame,
+                counter,
+                lock,
+                total,
+                t0,
+                log_progress,
+            )
 
         for t in threads:
             t.join()
@@ -289,8 +305,9 @@ class ESRGANEngine:
 
         elapsed = time.time() - t0
         c = counter[0]
-        print(f"    ESRGAN done: {c} frames  "
-              f"{elapsed:.0f}s  {c/elapsed:.1f}fps", flush=True)
+        if log_progress:
+            print(f"    ESRGAN done: {c} frames  "
+                  f"{elapsed:.0f}s  {c/elapsed:.1f}fps", flush=True)
         return c
 
     def process_frames(self, frames: list[np.ndarray],
@@ -318,5 +335,7 @@ class ESRGANEngine:
         return store
 
     def process_streaming(self, frames: list[np.ndarray],
-                          on_frame: Callable[[int, np.ndarray], None]) -> int:
-        return self._run_parallel(frames, store=None, on_frame=on_frame)
+                          on_frame: Callable[[int, np.ndarray], None],
+                          log_progress: bool = True) -> int:
+        return self._run_parallel(
+            frames, store=None, on_frame=on_frame, log_progress=log_progress)
