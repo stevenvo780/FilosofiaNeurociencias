@@ -5,12 +5,17 @@ Run:  python3 test_components.py
       python3 test_components.py streaming   # run only streaming test
 """
 import sys, os, time, gc, subprocess, json, threading
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 import numpy as np
-from pathlib import Path
 
-SRC = Path("GMT20260320-130023_Recording_2240x1260.mp4").resolve()
+SRC = (ROOT / "videos" / "GMT20260320-130023_Recording_2240x1260.mp4").resolve()
 W, H, FPS = 2240, 1260, 25.0
 CHUNK_DUR = 10.0  # 10 seconds = 250 frames
 START = 60.0      # skip first minute (might be black)

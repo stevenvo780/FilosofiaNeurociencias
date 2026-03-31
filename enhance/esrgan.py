@@ -22,9 +22,12 @@ class ESRGANEngine:
         import spandrel
         self.torch = torch
 
+        torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch.backends.cudnn, "benchmark_limit"):
+            torch.backends.cudnn.benchmark_limit = 0
 
         self.ngpu = min(torch.cuda.device_count(), 2)
         self.models = []
@@ -41,6 +44,7 @@ class ESRGANEngine:
             m = spandrel.ModelLoader().load_from_file(C.ESRGAN_MODEL)
             self.scale = m.scale
             net = m.model.half().to(dev).eval()
+            net = self._maybe_compile(net, gid, bs, dev)
             self.models.append(net)
             self.streams.append(torch.cuda.Stream(device=dev))
 
@@ -66,6 +70,36 @@ class ESRGANEngine:
             with torch.inference_mode():
                 _ = self.cpu_model(dummy)
             del dummy
+
+    def _maybe_compile(self, net, gid: int, bs: int, dev: str):
+        """Compile the model when available, but fall back cleanly."""
+        torch = self.torch
+        if not C.ENABLE_TORCH_COMPILE:
+            return net
+
+        try:
+            compile_kwargs = {
+                "fullgraph": C.TORCH_COMPILE_FULLGRAPH,
+                "dynamic": False,
+            }
+            if C.TORCH_COMPILE_DISABLE_CUDAGRAPHS:
+                compile_kwargs["options"] = {"triton.cudagraphs": False}
+            else:
+                compile_kwargs["mode"] = C.TORCH_COMPILE_MODE
+
+            compiled = torch.compile(net, **compile_kwargs)
+            dummy = torch.randn(bs, 3, 315, 560, device=dev, dtype=torch.float16)
+            with torch.inference_mode():
+                _ = compiled(dummy)
+                _ = compiled(dummy)
+            torch.cuda.synchronize(gid)
+            del dummy
+            msg = "cudagraphs=off" if C.TORCH_COMPILE_DISABLE_CUDAGRAPHS else f"mode={C.TORCH_COMPILE_MODE}"
+            print(f"    compile=on  {msg}", flush=True)
+            return compiled
+        except Exception as exc:
+            print(f"    compile=off  reason={exc}", flush=True)
+            return net
 
     def _gpu_worker(self, gid: int, frames: list[np.ndarray], get_batch: Callable,
                     store: list | None, on_frame: Callable | None,
@@ -256,32 +290,35 @@ class ESRGANEngine:
         t0 = time.time()
 
         threads = []
-        
+        errors: list[BaseException] = []
+
+        def launch(target, *args):
+            def runner():
+                try:
+                    target(*args)
+                except BaseException as exc:
+                    errors.append(exc)
+                    C.shutdown.set()
+            thread = threading.Thread(target=runner)
+            thread.start()
+            threads.append(thread)
+
         # Deploy fetching worker for GPU0 (Fastest: Pulls 8 frames automatically)
-        t = threading.Thread(
-            target=self._gpu_worker,
-            args=(0, frames, get_batch, store, on_frame, counter, lock, total, t0))
-        t.start()
-        threads.append(t)
+        launch(self._gpu_worker, 0, frames, get_batch, store, on_frame, counter, lock, total, t0)
         
         # Deploy fetching worker for GPU1 (Slightly Slower: Pulls 4 frames automatically)
         if self.ngpu > 1:
-            t = threading.Thread(
-                target=self._gpu_worker,
-                args=(1, frames, get_batch, store, on_frame, counter, lock, total, t0))
-            t.start()
-            threads.append(t)
+            launch(self._gpu_worker, 1, frames, get_batch, store, on_frame, counter, lock, total, t0)
             
         # Deploy fetching worker for CPU (R9 Processor: Pulls 1 frame slowly behind them)
         if self.cpu_enabled:
-            t = threading.Thread(
-                target=self._cpu_worker,
-                args=(frames, get_batch, store, on_frame, counter, lock, total, t0))
-            t.start()
-            threads.append(t)
+            launch(self._cpu_worker, frames, get_batch, store, on_frame, counter, lock, total, t0)
 
         for t in threads:
             t.join()
+
+        if errors:
+            raise RuntimeError(f"ESRGAN worker failed: {errors[0]}") from errors[0]
 
         elapsed = time.time() - t0
         c = counter[0]
