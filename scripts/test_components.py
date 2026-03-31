@@ -409,6 +409,7 @@ def test_profiles_load():
         assert aup.name == name
     
     print("  [OK] All profiles loaded successfully")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -426,7 +427,8 @@ def test_model_registry():
     assert "anime_baseline" in keys, "Missing anime_baseline model"
     assert "real_x2" in keys, "Missing real_x2 model"
     
-    print("  [OK] Model registry: {len(models)} models registered")
+    print(f"  [OK] Model registry: {len(models)} models registered")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -450,6 +452,7 @@ def test_audio_filter_syntax():
             print(f"  [FAIL] Audio profile '{name}': {result.stderr.strip()}")
             raise RuntimeError(f"Invalid audio filter for profile '{name}'")
         print(f"  [OK] Audio profile '{name}' filter chain valid")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -479,6 +482,7 @@ def test_scheduler_wrapping():
     # Reset to baseline
     apply_scheduler_profile(SchedulerProfile(name="baseline"))
     print("  [OK] Scheduler wrapping works correctly")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -498,16 +502,28 @@ def test_rife_backend_creation():
     backend = create_backend(RIFEBackendProfile(name="test", backend="ncnn"))
     assert isinstance(backend, NCNNBackend)
     
-    # Torch — should create but methods raise NotImplementedError
+    # T15: Torch — should create and be functional (no longer stub)
     backend = create_backend(RIFEBackendProfile(name="test", backend="torch"))
     assert isinstance(backend, TorchBackend)
-    try:
-        backend.interpolate_sync(None, None)
-        raise AssertionError("TorchBackend should raise NotImplementedError")
-    except NotImplementedError:
-        pass
+    assert backend.name() == "torch"
+    assert backend.expected_output_frames(10) == 20
+
+    # Test with real temp directories
+    import tempfile, cv2
+    with tempfile.TemporaryDirectory() as td:
+        in_dir = Path(td) / "in"
+        out_dir = Path(td) / "out"
+        in_dir.mkdir()
+        # Create 3 tiny test PNGs
+        for i in range(3):
+            img = np.zeros((16, 16, 3), dtype=np.uint8)
+            img[:, :, 0] = i * 80
+            cv2.imwrite(str(in_dir / f"{i+1:08d}.png"), img)
+        n = backend.interpolate_sync(in_dir, out_dir)
+        assert n >= 5, f"Expected >= 5 output frames from 3 inputs, got {n}"
     
     print("  [OK] RIFE backend factory works correctly")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -541,6 +557,7 @@ def test_metrics_new_fields():
         assert data["rife_backend"] == "ncnn"
     
     print("  [OK] New metric fields work correctly")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
