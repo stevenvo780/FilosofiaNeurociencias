@@ -936,7 +936,9 @@ def encode_worker(worker_idx: int, gpu: int, prog: Progress,
 
 def run(chunks, src: Path, work: Path, prog: Progress,
         do_esr: bool, do_rife: bool, fps: float,
-        esr: ESRGANEngine | None, w: int = 2240, h: int = 1260):
+        esr: ESRGANEngine | None, w: int = 2240, h: int = 1260,
+        visual_profile=None, audio_profile=None,
+        scheduler_profile=None, rife_backend_profile=None):
     """Pipeline: Extract → RIFE(1260p) → ESRGAN → NVENC."""
     total = len(chunks)
     done_n = sum(1 for c in chunks if prog.done(c[0], "encode"))
@@ -949,6 +951,18 @@ def run(chunks, src: Path, work: Path, prog: Progress,
     Path(C.TMPFS_WORK).mkdir(parents=True, exist_ok=True)
     budget = _BudgetController()
     metrics = _MetricsStore(work)
+
+    # Record profile identifiers in metrics store for all chunks
+    profile_tags = {}
+    if visual_profile:
+        profile_tags["visual_profile"] = visual_profile.name
+    if audio_profile:
+        profile_tags["audio_profile"] = audio_profile.name
+    if scheduler_profile:
+        profile_tags["scheduler_profile"] = scheduler_profile.name
+    if rife_backend_profile:
+        profile_tags["rife_backend"] = rife_backend_profile.name
+
     q_extract = queue.Queue(maxsize=C.PIPELINE_DEPTH)
     q_rife = queue.Queue(maxsize=C.PIPELINE_DEPTH)
     q_encode = queue.Queue(maxsize=max(C.PIPELINE_DEPTH, 1))

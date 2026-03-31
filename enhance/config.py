@@ -11,7 +11,8 @@ os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # ── PATHS ───────────────────────────────────────────────────
-ESRGAN_MODEL = "/tmp/realesr-animevideov3.pth"
+_ESRGAN_MODEL_FALLBACK = "/tmp/realesr-animevideov3.pth"
+ESRGAN_MODEL = _ESRGAN_MODEL_FALLBACK  # backward-compat alias
 RIFE_BIN = "/tmp/rife-ncnn/rife-ncnn-vulkan-20221029-ubuntu/rife-ncnn-vulkan"
 RIFE_MODEL_DIR = "/tmp/rife-ncnn/rife-ncnn-vulkan-20221029-ubuntu/rife-v4.6"
 TMPFS_WORK = "/tmp/enhance_work"  # tmpfs ramdisk for intermediate frames
@@ -101,6 +102,40 @@ AUDIO_FILTER = os.getenv(
         "dynaudnorm=f=250:g=31:p=0.95:m=8.0",
     ]),
 )
+
+# ── PROFILE-AWARE OVERLAY ───────────────────────────────────
+# These variables integrate with the new profile system (profiles.py,
+# audio_profiles.py, scheduler.py, rife_backend.py).  When set via env
+# vars the corresponding profile is loaded; otherwise the low-level
+# constants above are used directly (full backward compatibility).
+
+VISUAL_PROFILE_NAME = os.getenv("ENHANCE_VISUAL_PROFILE", None)
+AUDIO_PROFILE_NAME = os.getenv("ENHANCE_AUDIO_PROFILE", None)
+SCHEDULER_PROFILE_NAME = os.getenv("ENHANCE_SCHEDULER_PROFILE", None)
+RIFE_BACKEND_NAME = os.getenv("ENHANCE_RIFE_BACKEND", None)
+
+MODELS_DIR = os.getenv("ENHANCE_MODELS_DIR", None)  # e.g. "/data/models"
+AUDIO_CPUSET = os.getenv("ENHANCE_AUDIO_CPUSET", "")  # e.g. "0-3"
+RIFE_CLEANUP_MODE = os.getenv("ENHANCE_RIFE_CLEANUP_MODE", "inline")  # inline | deferred | none
+
+
+def resolve_esrgan_model(profile_model_filename: str | None = None) -> str:
+    """Return the absolute path to the ESRGAN model weights.
+
+    Resolution order:
+      1. *profile_model_filename* under ``MODELS_DIR`` (if both are set and the
+         file exists).
+      2. ``ESRGAN_MODEL`` env-var / hardcoded fallback.
+
+    This keeps the old ``ESRGAN_MODEL`` constant working for every caller that
+    doesn't know about profiles.
+    """
+    if MODELS_DIR and profile_model_filename:
+        candidate = os.path.join(MODELS_DIR, profile_model_filename)
+        if os.path.isfile(candidate):
+            return candidate
+    return ESRGAN_MODEL
+
 
 # ── GRACEFUL SHUTDOWN ───────────────────────────────────────
 shutdown = threading.Event()

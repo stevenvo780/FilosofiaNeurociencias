@@ -5,6 +5,7 @@ import shutil
 import sys
 import threading
 import time
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,7 +43,40 @@ def main():
                     help="Clean work directory and restart")
     ap.add_argument("--outdir", type=str, default=None,
                     help="Output directory (default: <input_dir>/enhanced)")
+    ap.add_argument("--visual-profile", type=str, default=None,
+                    help="Visual quality profile (baseline, real_x2, hybrid_detail, face_adaptive)")
+    ap.add_argument("--audio-profile", type=str, default=None,
+                    help="Audio processing profile (baseline, conservative, voice, natural)")
+    ap.add_argument("--scheduler-profile", type=str, default=None,
+                    help="CPU scheduler profile (baseline, split_l3_a, split_l3_b)")
+    ap.add_argument("--rife-backend", type=str, default=None,
+                    help="RIFE backend (baseline, torch)")
+    ap.add_argument("--models-dir", type=str, default=None,
+                    help="Directory for model weights")
+    ap.add_argument("--benchmark-tag", type=str, default=None,
+                    help="Tag for benchmark identification")
+    ap.add_argument("--quality-only", action="store_true",
+                    help="Only run quality evaluation")
+    ap.add_argument("--throughput-only", action="store_true",
+                    help="Skip quality evaluation")
+    ap.add_argument("--nsys", action="store_true",
+                    help="Wrap with NVIDIA Nsight Systems profiler")
     args = ap.parse_args()
+
+    # ── Load profiles ──
+    from enhance.profiles import get_profiles
+    from enhance.scheduler import apply_scheduler_profile
+    vp, aup, sp, rp = get_profiles(
+        visual=args.visual_profile,
+        audio=args.audio_profile,
+        scheduler=args.scheduler_profile,
+        rife_backend=args.rife_backend,
+    )
+    apply_scheduler_profile(sp)
+
+    # Override config from profiles where applicable
+    if args.models_dir:
+        os.environ["ENHANCE_MODELS_DIR"] = args.models_dir
 
     src = Path(args.input).resolve()
     if not src.exists():
@@ -96,7 +130,7 @@ def main():
         if not audio_out.exists():
             def _run_audio():
                 try:
-                    enhance_audio(audio_src, audio_out, start=start_at, duration=process_dur)
+                    enhance_audio(audio_src, audio_out, start=start_at, duration=process_dur, audio_profile=aup)
                 except Exception as exc:
                     audio_error["error"] = exc
             audio_thread = threading.Thread(target=_run_audio, name="Audio Enhance", daemon=True)
@@ -112,6 +146,7 @@ def main():
     print(f"  ESRGAN: {'ON' if do_esr else 'SKIP'}  |  RIFE: {'ON' if do_rife else 'SKIP'}")
     print(f"  Audio:  {'ENHANCE' if (audio_src and not args.skip_audio) else ('COPY' if audio_src else 'NONE')}")
     print(f"  Tmpfs:  {C.TMPFS_WORK}  (PNG intermedios en tmpfs + ventanas en RAM)")
+    print(f"  Profiles: visual={vp.name} audio={aup.name} sched={sp.name} rife={rp.name}")
     print("=" * 60)
 
     prog = Progress(work)
@@ -138,7 +173,7 @@ def main():
         esr = None
         if do_esr:
             from enhance.esrgan import ESRGANEngine
-            esr = ESRGANEngine()
+            esr = ESRGANEngine(visual_profile=vp)
         run_pipeline(
             chunks, src, work, prog, do_esr, do_rife, fps, esr,
             w=w, h=h)

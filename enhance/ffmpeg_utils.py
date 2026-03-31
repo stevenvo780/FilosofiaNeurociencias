@@ -56,13 +56,37 @@ def resolve_audio_source(src: Path, explicit: Path | None = None) -> Path | None
 
 def enhance_audio(src: Path, dst: Path,
                   start: float = 0.0,
-                  duration: float | None = None):
-    """Enhance audio quality using FFT denoise + normalization."""
+                  duration: float | None = None,
+                  audio_profile=None):
+    """Enhance audio quality using configurable filter chain from profile."""
     if dst.exists() and dst.stat().st_size > 1024:
         return
 
+    # Resolve audio parameters from profile or config fallback
+    if audio_profile is not None:
+        af = audio_profile.filter_chain
+        codec = audio_profile.codec
+        bitrate = audio_profile.bitrate
+        sample_rate = str(audio_profile.sample_rate)
+        threads = str(audio_profile.threads)
+    else:
+        af = C.AUDIO_FILTER
+        codec = C.AUDIO_CODEC
+        bitrate = C.AUDIO_BITRATE
+        sample_rate = "48000"
+        threads = C.AUDIO_THREADS
+
     dst.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["ffmpeg", "-y"]
+
+    # Optionally wrap command with scheduler affinity
+    base_cmd = ["ffmpeg", "-y"]
+    try:
+        from .scheduler import wrap_subprocess
+        base_cmd = wrap_subprocess(base_cmd, role="audio")
+    except ImportError:
+        pass
+
+    cmd = list(base_cmd)
     if start > 0:
         cmd += ["-ss", str(start)]
     cmd += ["-i", str(src)]
@@ -71,11 +95,11 @@ def enhance_audio(src: Path, dst: Path,
     cmd += [
         "-vn",
         "-map", "0:a:0",
-        "-af", C.AUDIO_FILTER,
-        "-c:a", C.AUDIO_CODEC,
-        "-b:a", C.AUDIO_BITRATE,
-        "-ar", "48000",
-        "-threads", C.AUDIO_THREADS,
+        "-af", af,
+        "-c:a", codec,
+        "-b:a", bitrate,
+        "-ar", sample_rate,
+        "-threads", threads,
         "-movflags", "+faststart",
         str(dst),
         "-loglevel", "warning",
@@ -120,6 +144,11 @@ def extract_frames(src: Path, start: float, dur: float,
         return existing
 
     cmd = ["ffmpeg", "-y"]
+    try:
+        from .scheduler import wrap_subprocess
+        cmd = wrap_subprocess(cmd, role="ffmpeg")
+    except ImportError:
+        pass
     if C.ENABLE_NVDEC:
         cmd += ["-hwaccel", "cuda", "-c:v", "h264_cuvid"]
     cmd += [

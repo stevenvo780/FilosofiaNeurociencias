@@ -23,6 +23,12 @@ export ENHANCE_MAX_RIFE_READY_BYTES="${ENHANCE_MAX_RIFE_READY_BYTES:-3221225472}
 export ENHANCE_ENABLE_JSONL_METRICS="${ENHANCE_ENABLE_JSONL_METRICS:-1}"
 export ENHANCE_ESRGAN_PINNED_STAGING="${ENHANCE_ESRGAN_PINNED_STAGING:-0}"
 
+# ── Profile selection (baseline = current proven config) ────
+export ENHANCE_VISUAL_PROFILE="${ENHANCE_VISUAL_PROFILE:-baseline}"
+export ENHANCE_AUDIO_PROFILE="${ENHANCE_AUDIO_PROFILE:-baseline}"
+export ENHANCE_SCHEDULER_PROFILE="${ENHANCE_SCHEDULER_PROFILE:-baseline}"
+export ENHANCE_RIFE_BACKEND="${ENHANCE_RIFE_BACKEND:-baseline}"
+
 run_video() {
   local input="$1"
   shift || true
@@ -37,5 +43,13 @@ run_video() {
   echo "[$(date --iso-8601=seconds)] END $name" | tee -a "$logfile"
 }
 
-run_video "$ROOT/videos/GMT20260320-130023_Recording_2240x1260.mp4"
-run_video "$ROOT/videos/GMT20260320-130023_Recording_gallery_2240x1260.mp4" --clean
+run_video "$ROOT/videos/GMT20260320-130023_Recording_2240x1260.mp4" \
+  --visual-profile "$ENHANCE_VISUAL_PROFILE" \
+  --audio-profile "$ENHANCE_AUDIO_PROFILE" \
+  --scheduler-profile "$ENHANCE_SCHEDULER_PROFILE" \
+  --rife-backend "$ENHANCE_RIFE_BACKEND"
+run_video "$ROOT/videos/GMT20260320-130023_Recording_gallery_2240x1260.mp4" --clean \
+  --visual-profile "$ENHANCE_VISUAL_PROFILE" \
+  --audio-profile "$ENHANCE_AUDIO_PROFILE" \
+  --scheduler-profile "$ENHANCE_SCHEDULER_PROFILE" \
+  --rife-backend "$ENHANCE_RIFE_BACKEND"

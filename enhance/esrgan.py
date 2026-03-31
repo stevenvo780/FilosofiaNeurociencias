@@ -18,10 +18,15 @@ from . import config as C
 
 
 class ESRGANEngine:
-    def __init__(self):
+    def __init__(self, visual_profile=None):
         import torch
         import spandrel
         self.torch = torch
+        self.visual_profile = visual_profile
+        self._downscale_factor = visual_profile.downscale_factor if visual_profile else 0.5
+        self._hybrid_weight = visual_profile.hybrid_detail_weight if visual_profile else 0.0
+        self._face_adaptive = visual_profile.face_adaptive if visual_profile else False
+        self._face_roi = visual_profile.face_roi if visual_profile else (0.5, 0.0, 1.0, 0.5)
 
         torch.set_float32_matmul_precision(C.TORCH_MATMUL_PRECISION)
         torch.backends.cudnn.benchmark = C.CUDNN_BENCHMARK
@@ -46,9 +51,10 @@ class ESRGANEngine:
             bs = self.batches[idx]
             print(f"  [ESRGAN] GPU{gid} {name}  batch={bs}")
 
-            m = spandrel.ModelLoader().load_from_file(C.ESRGAN_MODEL)
+            model_path = self._resolve_model_path()
+            m = spandrel.ModelLoader().load_from_file(model_path)
             self.scale = m.scale
-            self.output_scale = max(1, int(round(self.scale * 0.5)))
+            self.output_scale = max(1, int(round(self.scale * self._downscale_factor)))
             net = m.model.half().to(dev).eval()
             net = self._maybe_compile(net, gid, bs, dev)
             self.models.append(net)
@@ -67,7 +73,8 @@ class ESRGANEngine:
         if self.cpu_enabled:
             print(f"  [ESRGAN] CPU Worker (AMD Threads=16)  batch=1")
             torch.set_num_threads(16)
-            m = spandrel.ModelLoader().load_from_file(C.ESRGAN_MODEL)
+            model_path = self._resolve_model_path()
+            m = spandrel.ModelLoader().load_from_file(model_path)
             self.cpu_model = m.model.to("cpu").eval()
             self.scale = m.scale
             
@@ -75,6 +82,17 @@ class ESRGANEngine:
             with torch.inference_mode():
                 _ = self.cpu_model(dummy)
             del dummy
+
+    def _resolve_model_path(self) -> str:
+        """Resolve ESRGAN model path from visual profile or config fallback."""
+        if self.visual_profile and self.visual_profile.model_key != "anime_baseline":
+            try:
+                from .models import ModelRegistry
+                registry = ModelRegistry()
+                return str(registry.get_path(self.visual_profile.model_key))
+            except Exception as exc:
+                print(f"  [ESRGAN] Model registry fallback: {exc}")
+        return C.ESRGAN_MODEL
 
     def _maybe_compile(self, net, gid: int, bs: int, dev: str):
         """Compile the model when available, but fall back cleanly."""
@@ -170,9 +188,12 @@ class ESRGANEngine:
                 with torch.cuda.stream(compute_stream):
                     compute_stream.wait_stream(copy_stream)
                     downscale_start.record()
-                    t_small = torch.nn.functional.interpolate(
-                        t_gpu, scale_factor=0.5,
-                        mode="bilinear", align_corners=False)
+                    if self._downscale_factor < 1.0:
+                        t_small = torch.nn.functional.interpolate(
+                            t_gpu, scale_factor=self._downscale_factor,
+                            mode="bilinear", align_corners=False)
+                    else:
+                        t_small = t_gpu
                     downscale_end.record()
 
                     infer_start.record()
@@ -205,9 +226,12 @@ class ESRGANEngine:
                 h2d_dt = time.time() - h2d_t0
 
                 downscale_t0 = time.time()
-                t_small = torch.nn.functional.interpolate(
-                    t_gpu, scale_factor=0.5,
-                    mode="bilinear", align_corners=False)
+                if self._downscale_factor < 1.0:
+                    t_small = torch.nn.functional.interpolate(
+                        t_gpu, scale_factor=self._downscale_factor,
+                        mode="bilinear", align_corners=False)
+                else:
+                    t_small = t_gpu
                 downscale_dt = time.time() - downscale_t0
 
                 infer_t0 = time.time()
@@ -222,6 +246,20 @@ class ESRGANEngine:
                 d2h_dt = time.time() - d2h_t0
 
             out_np = out_cpu.numpy()
+
+            # Apply visual post-processing from profile
+            if self._hybrid_weight > 0.0 or self._face_adaptive:
+                from .visual_eval import apply_hybrid_detail, apply_face_adaptive
+                for i in range(cur_bs):
+                    gidx = start + i
+                    original = frames[gidx]
+                    if self._hybrid_weight > 0.0:
+                        out_np[i] = apply_hybrid_detail(
+                            out_np[i], original, self._hybrid_weight)
+                    if self._face_adaptive:
+                        out_np[i] = apply_face_adaptive(
+                            out_np[i], original, self._face_roi)
+
             writer_wait_dt = 0.0
             for i in range(cur_bs):
                 gidx = start + i
@@ -278,9 +316,12 @@ class ESRGANEngine:
             batch_t0 = time.time()
             t_cpu = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0).to("cpu", dtype=torch.float32) / 255.0
 
-            t_small = torch.nn.functional.interpolate(
-                t_cpu, scale_factor=0.5,
-                mode="bilinear", align_corners=False)
+            if self._downscale_factor < 1.0:
+                t_small = torch.nn.functional.interpolate(
+                    t_cpu, scale_factor=self._downscale_factor,
+                    mode="bilinear", align_corners=False)
+            else:
+                t_small = t_cpu
 
             with torch.inference_mode():
                 out = net(t_small)

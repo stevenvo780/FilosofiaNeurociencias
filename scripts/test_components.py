@@ -387,6 +387,163 @@ def test_pipeline_1chunk():
 
 
 # ─────────────────────────────────────────────────────────────
+# TEST 6: Profiles load
+# ─────────────────────────────────────────────────────────────
+def test_profiles_load():
+    """Smoke test: load all profile types and verify defaults."""
+    from enhance.profiles import get_profiles, VISUAL_PROFILES, AUDIO_PROFILES
+    
+    # Default profiles
+    vp, aup, sp, rp = get_profiles()
+    assert vp.name == "baseline", f"Expected baseline visual, got {vp.name}"
+    assert aup.name == "baseline", f"Expected baseline audio, got {aup.name}"
+    assert sp.name == "baseline", f"Expected baseline scheduler, got {sp.name}"
+    assert rp.name == "baseline", f"Expected baseline rife backend, got {rp.name}"
+    
+    # All registered profiles should load
+    for name in VISUAL_PROFILES:
+        vp, _, _, _ = get_profiles(visual=name)
+        assert vp.name == name
+    for name in AUDIO_PROFILES:
+        _, aup, _, _ = get_profiles(audio=name)
+        assert aup.name == name
+    
+    print("  [OK] All profiles loaded successfully")
+
+
+# ─────────────────────────────────────────────────────────────
+# TEST 7: Model registry
+# ─────────────────────────────────────────────────────────────
+def test_model_registry():
+    """Smoke test: model registry lists known models."""
+    from enhance.models import ModelRegistry
+    
+    registry = ModelRegistry()
+    models = registry.list_models()
+    assert len(models) >= 2, f"Expected >= 2 models, got {len(models)}"
+    
+    keys = [m.key for m in models]
+    assert "anime_baseline" in keys, "Missing anime_baseline model"
+    assert "real_x2" in keys, "Missing real_x2 model"
+    
+    print("  [OK] Model registry: {len(models)} models registered")
+
+
+# ─────────────────────────────────────────────────────────────
+# TEST 8: Audio filter syntax
+# ─────────────────────────────────────────────────────────────
+def test_audio_filter_syntax():
+    """Smoke test: all audio profile filter chains are valid ffmpeg syntax."""
+    from enhance.profiles import AUDIO_PROFILES
+    import subprocess
+    
+    for name, profile in AUDIO_PROFILES.items():
+        # Use ffmpeg's filter validation: -af <chain> with null input
+        cmd = [
+            "ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            "-t", "0.1", "-af", profile.filter_chain,
+            "-f", "null", "-",
+            "-loglevel", "error",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"  [FAIL] Audio profile '{name}': {result.stderr.strip()}")
+            raise RuntimeError(f"Invalid audio filter for profile '{name}'")
+        print(f"  [OK] Audio profile '{name}' filter chain valid")
+
+
+# ─────────────────────────────────────────────────────────────
+# TEST 9: Scheduler wrapping
+# ─────────────────────────────────────────────────────────────
+def test_scheduler_wrapping():
+    """Smoke test: scheduler wrap_subprocess produces valid command prefixes."""
+    from enhance.profiles import SchedulerProfile
+    from enhance.scheduler import apply_scheduler_profile, wrap_subprocess
+    
+    # Baseline — no wrapping
+    apply_scheduler_profile(SchedulerProfile(name="baseline"))
+    cmd = wrap_subprocess(["echo", "test"], role="ffmpeg")
+    assert cmd == ["echo", "test"], f"Baseline should not wrap: {cmd}"
+    
+    # split_l3_a — should add taskset
+    apply_scheduler_profile(SchedulerProfile(
+        name="test_l3",
+        cpuset_ffmpeg="0-7,16-23",
+        cpuset_audio="0-7,16-23",
+        cpuset_python="8-15,24-31",
+    ))
+    cmd = wrap_subprocess(["echo", "test"], role="ffmpeg")
+    assert "taskset" in cmd, f"Expected taskset in wrapped cmd: {cmd}"
+    assert "0-7,16-23" in cmd, f"Expected cpuset in cmd: {cmd}"
+    
+    # Reset to baseline
+    apply_scheduler_profile(SchedulerProfile(name="baseline"))
+    print("  [OK] Scheduler wrapping works correctly")
+
+
+# ─────────────────────────────────────────────────────────────
+# TEST 10: RIFE backend creation
+# ─────────────────────────────────────────────────────────────
+def test_rife_backend_creation():
+    """Smoke test: RIFE backend factory creates correct backend type."""
+    from enhance.rife_backend import create_backend, NCNNBackend, TorchBackend
+    from enhance.profiles import RIFEBackendProfile
+    
+    # Default — ncnn
+    backend = create_backend()
+    assert isinstance(backend, NCNNBackend), f"Expected NCNNBackend, got {type(backend)}"
+    assert backend.name() == "ncnn"
+    
+    # Explicit ncnn
+    backend = create_backend(RIFEBackendProfile(name="test", backend="ncnn"))
+    assert isinstance(backend, NCNNBackend)
+    
+    # Torch — should create but methods raise NotImplementedError
+    backend = create_backend(RIFEBackendProfile(name="test", backend="torch"))
+    assert isinstance(backend, TorchBackend)
+    try:
+        backend.interpolate_sync(None, None)
+        raise AssertionError("TorchBackend should raise NotImplementedError")
+    except NotImplementedError:
+        pass
+    
+    print("  [OK] RIFE backend factory works correctly")
+
+
+# ─────────────────────────────────────────────────────────────
+# TEST 11: Metrics new fields
+# ─────────────────────────────────────────────────────────────
+def test_metrics_new_fields():
+    """Smoke test: new metric fields are present in chunk_metrics schema."""
+    from enhance.pipeline import _MetricsStore
+    from pathlib import Path
+    import tempfile
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ms = _MetricsStore(Path(tmpdir))
+        ms.update(0, 
+                  rife_spawn_seconds=0.1,
+                  rife_compute_seconds=1.0,
+                  rife_drain_seconds=0.2,
+                  rife_cleanup_seconds=0.05,
+                  visual_profile="baseline",
+                  audio_profile="baseline",
+                  scheduler_profile="baseline",
+                  rife_backend="ncnn")
+        snap = ms.snapshot(0)
+        assert snap["visual_profile"] == "baseline"
+        assert snap["rife_spawn_seconds"] == 0.1
+        ms.emit(0)
+        metrics_file = Path(tmpdir) / "chunk_metrics.jsonl"
+        assert metrics_file.exists(), "chunk_metrics.jsonl not created"
+        import json
+        data = json.loads(metrics_file.read_text().strip())
+        assert data["rife_backend"] == "ncnn"
+    
+    print("  [OK] New metric fields work correctly")
+
+
+# ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if not SRC.exists():
         print(f"[!] Video not found: {SRC}")
@@ -398,6 +555,12 @@ if __name__ == "__main__":
         ("encode", test_encode),
         ("streaming", test_streaming),
         ("pipeline", test_pipeline_1chunk),
+        ("profiles", test_profiles_load),
+        ("models", test_model_registry),
+        ("audio_filter", test_audio_filter_syntax),
+        ("scheduler", test_scheduler_wrapping),
+        ("rife_backend", test_rife_backend_creation),
+        ("metrics", test_metrics_new_fields),
     ]
 
     # Allow running specific test: python3 test_components.py esrgan
