@@ -1,493 +1,408 @@
-# Plan Real de Reestructuración para Acelerar el Segundo Video
+# Plan Maestro de Optimización y Calidad del Segundo Video
 
 Fecha: 2026-03-31
 
-## Resumen Ejecutivo
+## 1. Objetivo
 
-El plan anterior era correcto en la intuición, pero insuficiente en profundidad.
+Entregar el segundo video con estas condiciones simultáneas:
 
-El cuello real no es solo "`ESRGAN` va más lento que `RIFE`". El cuello real es más duro:
+- throughput `>= 0.40x realtime`
+- uso útil máximo del hardware disponible
+- calidad visual superior al video 1 en rostros
+- calidad de audio superior a la cadena actual
+- estabilidad total del pipeline en corridas largas
 
-1. El pipeline sigue organizado por `chunk` completo.
-2. `RIFE` sigue encapsulado como binario externo con ABI de carpetas PNG.
-3. `ESRGAN` todavía hace demasiadas copias, reasignaciones y sincronizaciones por batch.
-4. La memoria en vuelo no está modelada por bytes, solo por cantidad de elementos en cola.
-5. La coordinación actual está hecha por etapas rígidas, no por recursos y backlog útil.
+El plan está orientado a dos metas inseparables:
 
-Conclusión:
+1. reducir al máximo el tiempo de espera usando la PC de forma útil
+2. mejorar la calidad final sin introducir artefactos nuevos
 
-- Si solo afinamos colas, batches o threads, la mejora será marginal.
-- Si queremos de verdad exprimir la PC, hay que reestructurar la frontera entre `extract`, `RIFE`, `ESRGAN` y `NVENC`.
+## 2. Baseline Actual Medida
 
-Este documento reemplaza el plan anterior y divide el trabajo en tres rutas:
+### 2.1 Configuración estable actual
 
-- `Ruta conservadora`: cirugía fuerte sin cambiar el backend de `RIFE`
-- `Ruta profunda`: streaming real intra-chunk con scheduler por recurso
-- `Ruta máxima`: eliminar el ABI por PNG de `RIFE`
+- `RIFE` en GPU1
+- `ESRGAN + NVENC` en GPU0
+- `chunk = 15s`
+- `ENHANCE_RIFE_STREAM_WINDOW=192`
+- `ENHANCE_RIFE_MIN_WINDOW=64`
+- `ENHANCE_MAX_EXTRACT_BYTES_IN_FLIGHT=6 GiB`
+- `ENHANCE_MAX_RIFE_READY_BYTES=3 GiB`
+- `ENHANCE_MAX_ESRGAN_READY_FRAMES=192`
+- `ENHANCE_MAX_NVENC_BUFFERED_FRAMES=8`
+- `ENHANCE_RIFE_THREADS=1:8:4`
+- `ENHANCE_ESRGAN_PINNED_STAGING=0`
 
-## Estado Real del Pipeline Actual
+### 2.2 Resultado real del bench largo
 
-Archivos implicados:
+Bench validado de `5 min`:
 
-- [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py)
-- [enhance/rife.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/rife.py)
-- [enhance/esrgan.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/esrgan.py)
-- [enhance/ffmpeg_utils.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/ffmpeg_utils.py)
+- salida válida: `4480x2520 @ 50 fps`
+- `20` chunks procesados
+- throughput global: `0.38x realtime`
+- promedio por chunk: `39.645s`
+- `effective_fps` promedio: `18.922`
+- `RIFE` promedio: `39.081s`
+- `RIFE fps` promedio: `19.195`
+- `ESRGAN` promedio: `29.007s`
+- `readback` promedio: `2.069s`
+- `encode` promedio: `3.136s`
+- `window_avg_frames`: `123.438`
+- `window_max_frames`: `188.35`
+- `extract_peak_bytes`: `~6.19 GiB`
+- `rife_ready_peak_bytes`: `~1.59 GiB`
 
-Métricas reales medidas en producción y slices:
+### 2.3 Brecha exacta contra la meta
 
-- `Extract`: `~105-200 fps`
-- `RIFE input write`: `~400-635 fps`
-- `RIFE`: `~29-32 fps`
-- `RIFE readback`: `~420-570 fps`
-- `ESRGAN`: `~20.9-24.8 fps`
-- throughput global estable reciente: `~0.32x realtime`
+Meta:
 
-Lectura correcta:
+- `>= 0.40x realtime`
 
-- `RIFE` ya no es el cuello dominante.
-- `ESRGAN` limita el throughput total.
-- Pero el pipeline no está realmente "ocupando mal la GPU" por un único motivo.
-- Está perdiendo tiempo en barreras de arquitectura, especialmente entre `RIFE` y `ESRGAN`.
+Con chunks de `15s`, eso implica:
 
-## Autocrítica del Plan Anterior
+- tiempo máximo medio por chunk: `37.5s`
 
-El plan anterior fue flojo en estos puntos:
+Estado actual:
 
-1. No trató como prioridad máxima el ABI de `RIFE` basado en carpetas PNG.
-2. No cuantificó la memoria real en vuelo.
-3. No separó "optimización del pipeline actual" de "reescritura estructural".
-4. No identificó con suficiente dureza el doble y triple copiado del datapath.
-5. Puso demasiado pronto la idea de usar la `RTX 2060` para ayudar a `ESRGAN`.
-6. No definió presupuestos de backlog en bytes ni criterios de backpressure por recurso.
+- tiempo medio observado: `39.645s`
 
-## Cuellos Exactos del Código
+Brecha:
 
-### 1. Barrera extract -> RIFE
+- faltan `2.145s` por chunk
+- faltan `~5.41%` de mejora total
+- faltan `~1.078 fps` efectivos
 
-Hoy se hace esto:
+## 3. Problemas Pendientes
 
-- `ffmpeg -> RAM` en [enhance/ffmpeg_utils.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/ffmpeg_utils.py#L86)
-- `RAM -> PNG` en [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py#L277)
+## 3.1 Rendimiento
 
-Eso significa:
+El cuello real actual es `RIFE`.
 
-- se materializa el chunk entero en RAM
-- luego se vuelve a serializar el chunk entero a PNG
-- luego `RIFE` vuelve a leerlo
+La evidencia es directa:
 
-Eso no es un detalle. Es una frontera de ABI costosa.
+- `RIFE ~= 39.081s`
+- `total ~= 39.645s`
 
-### 2. Barrera RIFE -> ESRGAN
+Eso significa que el chunk termina prácticamente cuando termina `RIFE`.
 
-Hoy `RIFE`:
+El coste real del camino `RIFE` incluye:
 
-- se ejecuta con `subprocess.run(...)` en [enhance/rife.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/rife.py#L14)
-- no devuelve control hasta terminar todo el chunk
+- escritura de entrada a PNG
+- spawn del binario `rife-ncnn-vulkan`
+- cómputo de interpolación
+- polling y drenaje de salida
+- lectura de PNGs listos
+- cleanup del chunk
 
-Y después recién:
+## 3.2 Calidad visual
 
-- se listan los PNGs
-- se releen todos a RAM en [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py#L295)
-- se entrega el chunk completo a `ESRGAN`
+Hallazgos perceptuales ya confirmados en el video 1:
 
-Esa es la barrera más dañina del diseño actual.
+- textos y contornos quedaron mejor
+- la fluidez mejoró claramente
+- los rostros se sobre suavizan
+- la piel queda plástica o maquillada
+- se pierde microdetalle en ojos, boca, barba fina y contorno facial
+- todavía hay aberraciones puntuales
 
-### 3. Cuello interno de ESRGAN
+Hipótesis técnicas principales:
 
-Dentro de `ESRGAN`, por batch, hoy ocurre:
+- el modelo actual está sesgado a `anime`
+- el `downscale 0.5x` previo a ESRGAN castiga demasiado el detalle facial
 
-- `np.stack(...)` en [enhance/esrgan.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/esrgan.py#L126)
-- copia H2D
-- `interpolate(scale_factor=0.5)` en GPU
-- inferencia
-- salida D2H en [enhance/esrgan.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/esrgan.py#L142)
-- `.numpy()`
-- copia adicional en `_ReorderWriter.on_frame()` en [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py#L64)
+## 3.3 Calidad de audio
 
-Eso explica por qué la `5070 Ti` no permanece llena todo el tiempo aunque `ESRGAN` siga siendo el cuello.
+Hallazgos actuales:
 
-### 4. Modelo de colas demasiado pobre
+- el audio ya mejora respecto al original
+- todavía suena demasiado procesado
+- la cadena puede estar aplanando timbre y dinámica
 
-Hoy el pipeline usa:
+Hipótesis técnica principal:
 
-- `Queue(maxsize=C.PIPELINE_DEPTH)` en [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py#L453)
+- `afftdn + loudnorm + dynaudnorm` está priorizando limpieza y control por encima de naturalidad
 
-Eso es insuficiente, porque un item de cola puede significar:
+## 4. Restricciones de Diseño
 
-- un chunk de entrada `~2.96 GiB`
-- un chunk post-RIFE `~5.91 GiB`
-- o mucho más si se materializa upscale
+Estas reglas quedan fijas salvo evidencia nueva muy fuerte:
 
-No se puede gobernar memoria real con "cantidad de chunks".
+- no lanzar dos renders largos en paralelo
+- no mezclar chunks viejos con arquitectura nueva
+- no volver a tomar `ESRGAN` como cuello principal sin evidencia
+- no activar `ENHANCE_ESRGAN_PINNED_STAGING=1` como default
+- no usar sharpening agresivo como remedio principal
+- no sacrificar calidad facial o audio para ganar pocos puntos de throughput
 
-## Modelo de Memoria que Debe Gobernar el Diseño
+## 5. Requisitos No Negociables
 
-Para `2240x1260`, `25 fps`, `15s`:
+## 5.1 Rendimiento
 
-- frame de entrada RGB: `8,467,200 bytes`
-- chunk extraído de `375` frames: `~2.96 GiB`
-- chunk post-RIFE de `749` frames: `~5.91 GiB`
-- frame 2x RGB: `33,868,800 bytes`
-- chunk 2x completo de `749` frames: `~23.63 GiB`
+- uso alto y sostenido de GPU0, GPU1 y CPU sin huecos evitables
+- backlog útil, no RAM muerta
+- swap estable o bajando
+- sin zombies al final
 
-Conclusión:
+## 5.2 Calidad visual
 
-- El programa nunca debe volver a materializar un chunk 2x completo en RAM.
-- El backlog no se debe configurar por cantidad de chunks.
-- El backlog se debe configurar por bytes y por frames.
+- mantener la mejora ya lograda en textos, bordes y fluidez
+- eliminar el look plástico de rostros
+- conservar o mejorar detalle facial real
+- no introducir halos notorios
 
-## Objetivo Correcto
+## 5.3 Calidad de audio
 
-El objetivo no es "ver CPU, RAM y dos GPU al 100% todo el tiempo" como KPI aislado.
+- menos ruido
+- mayor inteligibilidad
+- timbre natural
+- dinámica razonable
+- evitar sensación de audio demasiado aplastado
 
-El objetivo correcto es:
+## 6. Líneas de Trabajo
 
-- saturar de forma sostenida el recurso limitante
-- mantener backlog útil en los demás recursos
-- evitar burbujas entre etapas
-- no gastar RAM en datos que todavía no se van a consumir
-
-Dicho eso, sí hay margen real de mejora:
-
-- más ocupación útil de la `5070 Ti`
-- menos huecos en la `2060`
-- más trabajo útil del CPU en decode, staging y prefetch
-
-## Arquitectura Objetivo
-
-### Principio 1. Chunk lógico, ventana operativa
-
-Mantener:
-
-- chunk lógico de `15s` para reanudación, merge, progreso y fallos
-
-Cambiar a:
-
-- ventana operativa de `64-96` frames interpolados
-
-Eso permite:
-
-- arrancar `ESRGAN` antes
-- solapar `RIFE` y `ESRGAN` de verdad
-- contener la memoria en vuelo
-
-### Principio 2. Scheduler por recurso
-
-El sistema no debe pensar en "etapas lineales".
-
-Debe pensar en recursos:
-
-- decode CPU
-- PNG writer o extractor directo
-- `RIFE` en `GPU1`
-- readback de ventanas
-- `ESRGAN` en `GPU0`
-- `NVENC`
-- audio
-
-Cada recurso debe consumir la siguiente unidad lista según:
-
-- disponibilidad del recurso
-- backlog aguas abajo
-- presupuesto de memoria
-
-### Principio 3. Presupuesto explícito de memoria
-
-Se deben introducir budgets configurables:
-
-- `MAX_EXTRACT_BYTES_IN_FLIGHT`
-- `MAX_RIFE_READY_BYTES`
-- `MAX_ESRGAN_READY_FRAMES`
-- `MAX_NVENC_BUFFERED_FRAMES`
-
-No más `Queue(maxsize=2)` como mecanismo principal.
-
-## Rutas de Reestructuración
-
-## Ruta Conservadora
+## 6.1 Línea A. Calidad base visual y sonora
 
 Objetivo:
 
-- obtener mejora importante sin reemplazar `rife-ncnn-vulkan`
+- fijar un baseline de calidad aceptable antes del render largo final
 
-### Paso C1. Eliminar `extract -> RAM -> PNG`
+Trabajo visual:
 
-Archivos:
+1. reevaluar el modelo de upscale para material real
+2. reevaluar el `downscale 0.5x` previo a ESRGAN
+3. añadir preservación de detalle del original
+4. aplicar sharpen solo si sigue siendo necesario y siempre muy suave
 
-- [enhance/ffmpeg_utils.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/ffmpeg_utils.py)
-- [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py)
+Trabajo de audio:
 
-Cambio:
+1. comparar la cadena actual con una variante menos aplanadora
+2. reevaluar si `dynaudnorm` debe seguir como default
+3. ajustar `loudnorm` de forma más conservadora si mejora naturalidad
+4. validar con muestras cortas A/B
 
-- para el camino con `RIFE`, dejar de usar `extract_frames_to_ram(...)`
-- usar extracción directa a PNG para alimentar `RIFE`
+Criterio de salida de esta línea:
 
-Razón:
+- rostros dejan de verse maquillados
+- texto y fluidez no empeoran
+- audio más natural que la cadena actual
 
-- hoy decodificamos a RAM para luego serializar el mismo chunk a PNG
-- eso gasta CPU, RAM y tiempo sin valor añadido
+## 6.2 Línea B. Amortización del coste fijo de `RIFE`
 
-Impacto esperado:
+Objetivo:
 
-- menor presión de RAM
-- menor churn de GC
-- CPU mejor usada
+- quitar la mayor cantidad posible del `~5.41%` faltante sin cambiar backend
 
-### Paso C2. Convertir RIFE a ejecución observable
+Hipótesis principal:
 
-Archivos:
+- el tamaño de chunk puede estar penalizando la amortización del binario externo
 
-- [enhance/rife.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/rife.py)
-- [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py)
+Experimentos obligatorios:
 
-Cambio:
+1. control con `15s`
+2. bench con `20s`
+3. bench con `30s`
 
-- cambiar `subprocess.run(...)` por `subprocess.Popen(...)`
-- exponer PID, estado y finalización
-- permitir polling del directorio de salida
+Métricas obligatorias:
 
-Razón:
+- `total_seconds`
+- `effective_fps`
+- `rife_seconds`
+- `extract_peak_bytes`
+- swap
+- estabilidad de salida
 
-- sin esto no existe streaming intra-chunk real
+Condición para elegir una variante:
 
-Impacto esperado:
+- mejora real en `60s`
+- confirmación en `5 min`
 
-- no mejora solo por sí mismo
-- habilita la mejora importante del siguiente paso
+## 6.3 Línea C. Afinado disciplinado de `RIFE_THREADS`
 
-### Paso C3. Liberar ventanas contiguas desde la salida de RIFE
+Baseline:
 
-Archivos:
+- `1:8:4`
 
-- [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py)
+Matriz inicial:
 
-Cambio:
-
-- vigilar `rife_out`
-- detectar secuencias contiguas ya completas
-- leer solo ventanas listas
-- enviar esas ventanas a `ESRGAN`
-- no esperar el chunk entero
+1. `1:8:4`
+2. `1:10:4`
+3. `1:12:4`
+4. `1:8:6`
+5. `1:10:6`
 
 Regla:
 
-- una ventana solo se libera si todos sus índices existen y son legibles
+- esta matriz se corre solo con el mejor `chunk size` de la línea B
+- no se mezcla con otros cambios
 
-Impacto esperado:
+Condición para promover una variante:
 
-- adelantar el arranque de `ESRGAN` por chunk
-- reducir mucho las burbujas entre `GPU1` y `GPU0`
+- mejora real de `effective_fps`
+- confirmación en bench de `5 min`
 
-### Paso C4. Rehacer la gobernanza de memoria
-
-Archivos:
-
-- [enhance/config.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/config.py)
-- [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py)
-
-Cambio:
-
-- introducir budgets por bytes y frames
-- bloquear `extract` cuando el presupuesto de entrada esté lleno
-- bloquear `readback` cuando el backlog de `ESRGAN` sea excesivo
-
-Impacto esperado:
-
-- menos swap
-- menos picos de RAM
-- pipeline más estable
-
-## Ruta Profunda
+## 6.4 Línea D. Reducción del overhead del wrapper de `RIFE`
 
 Objetivo:
 
-- reestructurar el pipeline actual sin cambiar aún de backend de interpolación
+- sacar `0.5s - 1.5s` por chunk
+- reducir tiempos muertos de CPU y filesystem alrededor de `RIFE`
 
-### Paso P1. Scheduler por estados y recursos
+Trabajo:
 
-Archivos:
+1. polling incremental en vez de reescanear patrones completos
+2. reutilización de directorios temporales por chunk
+3. cleanup diferido y más barato
+4. pre-creación de estructura temporal
 
-- [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py)
-
-Estado mínimo por chunk:
-
-- `decode_pending`
-- `decode_ready`
-- `rife_running`
-- `rife_window_ready`
-- `esrgan_running`
-- `encode_running`
-- `done`
-
-Cambio:
-
-- abandonar la coordinación principal por colas stage-to-stage
-- introducir un scheduler central con colas internas por recurso
-
-Razón:
-
-- hoy las etapas se pasan sentinels y listas completas
-- eso es frágil y no refleja el uso real de hardware
-
-### Paso P2. Rehacer el datapath de ESRGAN
-
-Archivos:
-
-- [enhance/esrgan.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/esrgan.py)
-- [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py)
-
-Cambio:
-
-- prealocar batch buffers CPU contiguos
-- usar pinned staging real
-- usar dos `CUDA streams`
-- separar métricas de:
-  - `stack/fill`
-  - `H2D`
-  - `downscale`
-  - `infer`
-  - `D2H`
-  - `writer wait`
-
-Razón:
-
-- hoy no sabemos cuánto tiempo exacto se va en compute y cuánto en mover datos
-- sin esa separación, optimizar `ESRGAN` es disparar a ciegas
-
-Impacto esperado:
-
-- mayor ocupación útil de la `5070 Ti`
-- subida real de fps en el hot path
-
-### Paso P3. Quitar la copia redundante del writer
-
-Archivos:
-
-- [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py)
-
-Cambio:
-
-- rediseñar `_ReorderWriter` para trabajar con ownership de buffer
-- evitar `np.ascontiguousarray(...).copy()` por frame cuando el frame ya venga contiguo y transferido
-
-Razón:
-
-- ahora mismo se vuelve a copiar cada frame en [enhance/pipeline.py](/home/stev/Descargas/FilosofiaNeurociencias/enhance/pipeline.py#L67)
-
-Impacto esperado:
-
-- menor uso de memoria
-- menor CPU por frame
-- menor latencia hacia `NVENC`
-
-## Ruta Máxima
+## 6.5 Línea E. Telemetría fina del coste de `RIFE`
 
 Objetivo:
 
-- eliminar el ABI por PNG de `RIFE`
+- separar cómputo real de overhead fijo
 
-### Paso M1. Sustituir el backend de RIFE
+Métricas nuevas requeridas:
 
-Opciones:
+- `rife_spawn_seconds`
+- `rife_compute_seconds`
+- `rife_drain_seconds`
+- `rife_cleanup_seconds`
 
-- backend `torch`
-- backend `TensorRT`
-- backend que acepte frames/tensores en memoria
+Esta línea debe permitir responder con evidencia:
 
-Requisito:
+- cuánto tarda el modelo
+- cuánto tarda el contrato por chunk
 
-- entrada en memoria
-- salida en memoria
-- control fino de batches o ventanas
+## 6.6 Línea F. Ruta de backend nuevo para `RIFE`
 
-Razón:
+Esta línea solo se abre si las líneas B, C, D y E no bastan.
 
-- mientras `RIFE` dependa de directorios PNG, la orquestación fina siempre estará limitada
+Objetivo:
 
-Impacto esperado:
+- eliminar el ABI por PNG y el spawn por chunk
 
-- desaparición de la barrera más costosa del pipeline
-- mejor uso simultáneo de CPU, RAM y ambas GPU
-- arquitectura mucho más limpia
+Opciones a explorar:
 
-### Paso M2. Pipeline totalmente en memoria
+1. `RIFE` en PyTorch
+2. `RIFE` en TensorRT
+3. worker persistente de `RIFE`
 
-Flujo objetivo:
+Condición de apertura:
 
-- `ffmpeg decode -> frame ring`
-- `RIFE in-memory -> output ring`
-- `ESRGAN in-memory -> NVENC pipe`
+- no alcanzar `>= 0.40x` tras validar las líneas anteriores
 
-Persistencia:
+## 7. Secuencia Exacta de Ejecución
 
-- chunk logical metadata a disco
-- no frames intermedios a disco salvo fallback o debug
+### Fase 0. Calidad base
 
-Esta es la arquitectura que más se acerca a "usar la máquina de verdad".
+1. generar muestras cortas de rostros y voz
+2. ajustar modelo, preservación de detalle y cadena de audio
+3. congelar un baseline de calidad
 
-## Qué NO Debe Volver a Hacerse
+### Fase 1. Chunk size
 
-- no volver a materializar un chunk 2x completo en RAM
-- no confiar en `Queue(maxsize=n)` como control principal de memoria
-- no mezclar dos renders largos a la vez
-- no usar helper mode de la `2060` antes de quitar barreras mayores
-- no repetir `GPU0_BATCH=12`
-- no reactivar por defecto `torch.compile`, `allow_tf32` o `cudnn.benchmark=True` en esta máquina
+1. bench `15s`
+2. bench `20s`
+3. bench `30s`
+4. elegir ganador
 
-## Priorización Correcta
+### Fase 2. Threads de `RIFE`
 
-Orden correcto:
+1. correr matriz sobre el chunk size ganador
+2. seleccionar finalista
 
-1. instrumentación fina y budgets
-2. eliminar `extract -> RAM -> PNG`
-3. convertir `RIFE` a `Popen`
-4. liberar ventanas contiguas intra-chunk
-5. scheduler por recurso
-6. cirugía interna de `ESRGAN`
-7. evaluar si todavía tiene sentido que la `2060` ayude a `ESRGAN`
-8. decidir si se justifica cambiar de backend de `RIFE`
+### Fase 3. Wrapper de `RIFE`
 
-## Criterios de Aceptación por Etapa
+1. añadir telemetría fina
+2. optimizar polling
+3. optimizar cleanup
+4. optimizar directorios temporales
 
-### Aceptación mínima
+### Fase 4. Validación larga
 
-- throughput `> 0.35x realtime`
-- RAM estable, sin crecimiento progresivo
-- sin colgados ni deadlocks
+1. bench `60s`
+2. bench `5 min`
+3. validar memoria, swap y procesos
 
-### Aceptación buena
+### Fase 5. Decisión
 
-- `RIFE >= 30 fps`
-- `ESRGAN >= 26 fps`
+1. si cumple, relanzar el segundo video con `--clean`
+2. si no cumple, abrir backend nuevo de `RIFE`
+
+## 8. Criterio de Aceptación
+
+El plan se considera exitoso solo si se cumplen todas estas condiciones:
+
+- `effective_fps >= 20.0`
 - throughput `>= 0.40x realtime`
+- promedio por chunk `<= 37.5s`
+- uso alto y sostenido del hardware sin huecos evitables
+- swap plana o bajando durante `5 min`
+- sin `python3`, `ffmpeg` ni `rife-ncnn-vulkan` zombies al final
+- salida válida `4480x2520 @ 50 fps`
+- rostros sin sobre difuminado evidente
+- audio perceptualmente mejor que la cadena actual
 
-### Aceptación excelente
+## 9. Qué No Hacer
 
-- `ESRGAN >= 28 fps`
-- throughput `>= 0.45x realtime`
-- GPU0 con ocupación alta y sin burbujas largas
-- GPU1 con menos huecos visibles
+- no volver a tocar `torch.compile`
+- no volver a tocar `TF32`
+- no volver a perseguir `ESRGAN` como cuello principal sin evidencia nueva
+- no activar por defecto la ruta experimental de `pinned staging`
+- no meter helper mode de la `2060` para `ESRGAN`
+- no saltar a TensorRT sin agotar primero chunk size, threads y wrapper
 
-## Qué Haría Justo Después de Terminar el Video 1
+## 10. Errores Ya Medidos que No se Deben Repetir
 
-1. añadir telemetría por subfase y por bytes
-2. reemplazar el camino `extract_frames_to_ram -> _write_pngs` por extracción directa a PNG cuando `RIFE` esté activo
-3. convertir `RIFE` a proceso observable con `Popen`
-4. implementar ventanas contiguas `64-96` frames
-5. correr benchmark de `30s`
-6. correr benchmark de `5 min`
-7. solo después tocar el scheduler completo
+Estos puntos deben conservarse como memoria operativa del plan.
 
-## Veredicto
+### 10.1 Rendimiento
 
-La mejora real ya no depende de "apretar más los numeritos".
+1. Tratar `ESRGAN` como cuello principal después de la reestructuración.
+   - Los benches largos ya mostraron que el tiempo total sigue a `RIFE`.
 
-Depende de resolver tres cosas:
+2. Activar `ENHANCE_ESRGAN_PINNED_STAGING=1` como camino por defecto.
+   - La ruta existe, pero ya empeoró el throughput real en esta máquina.
 
-1. la frontera por PNG de `RIFE`
-2. la gobernanza de memoria por bytes
-3. el exceso de copias en `ESRGAN`
+3. Subir `ENHANCE_RIFE_MIN_WINDOW` a `128` como baseline.
+   - Ya rindió peor que `64`.
 
-Si solo afinamos parámetros, el segundo video seguirá siendo demasiado lento.
-Si reestructuramos estos tres puntos, sí hay margen real para que el segundo video salga bastante más rápido y con una utilización mucho más seria del hardware.
+4. Volver a controlar el pipeline por `Queue(maxsize=...)` como mecanismo principal.
+   - El control real debe seguir siendo por bytes y frames en vuelo.
+
+5. Lanzar dos renders largos en paralelo.
+   - Compite por recursos, degrada estabilidad y contamina la lectura de cuellos reales.
+
+6. Reutilizar chunks viejos del segundo video con la arquitectura nueva.
+   - El relanzamiento productivo debe seguir siendo con `--clean`.
+
+7. Abrir múltiples hipótesis en la misma prueba.
+   - Cada bench debe mover una sola variable.
+
+### 10.2 Calidad visual
+
+1. Dar por buena la calidad facial del video 1.
+   - Ya quedó demostrado que los rostros salen demasiado difuminados.
+
+2. Usar sharpening agresivo como primer remedio.
+   - Tiende a crear halos y no recupera microdetalle real.
+
+3. Optimizar solo textos y fluidez ignorando caras.
+   - El siguiente render debe mejorar ambas cosas a la vez.
+
+4. Asumir que el modelo actual es automáticamente correcto para rostros humanos.
+   - Esa suposición ya quedó cuestionada por el material real.
+
+### 10.3 Audio
+
+1. Dar por cerrada la cadena actual de audio.
+   - Ya se observó que sigue siendo mejorable.
+
+2. Priorizar limpieza extrema sobre naturalidad.
+   - El audio final no debe quedar artificialmente aplanado.
+
+## 11. Pregunta Operativa Central
+
+Todo el trabajo restante debe responder a esto:
+
+- cómo sacar `~2.15s` por chunk del camino real de `RIFE`
+- cómo llenar mejor la PC con trabajo útil
+- cómo hacerlo sin volver a degradar rostros ni audio
