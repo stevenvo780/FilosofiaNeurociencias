@@ -5,6 +5,7 @@ Chunk queues overlap CPU decode, Vulkan interpolation, dual-GPU ESRGAN and
 hardware NVENC encode across chunk boundaries.
 """
 import gc
+import json
 import queue
 import shutil
 import subprocess
@@ -28,6 +29,100 @@ from .rife import (
 )
 
 
+def _frame_bytes(w: int, h: int) -> int:
+    return w * h * 3
+
+
+class _BudgetController:
+    """Track in-flight work in real units instead of queue length."""
+
+    __slots__ = ("cond", "_extract", "_rife_ready")
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self._extract: dict[int, int] = {}
+        self._rife_ready: dict[int, int] = {}
+
+    def extract_total(self) -> int:
+        return sum(self._extract.values())
+
+    def rife_ready_total(self) -> int:
+        return sum(self._rife_ready.values())
+
+    def reserve_extract(self, cid: int, nbytes: int) -> tuple[int, int]:
+        with self.cond:
+            while (
+                self.extract_total() + nbytes > C.MAX_EXTRACT_BYTES_IN_FLIGHT
+                or self.rife_ready_total() > C.MAX_RIFE_READY_BYTES
+            ) and not C.shutdown.is_set():
+                self.cond.wait(timeout=0.1)
+            self._extract[cid] = nbytes
+            return self.extract_total(), self.rife_ready_total()
+
+    def update_extract(self, cid: int, nbytes: int) -> tuple[int, int]:
+        with self.cond:
+            self._extract[cid] = nbytes
+            self.cond.notify_all()
+            return self.extract_total(), self.rife_ready_total()
+
+    def release_extract(self, cid: int):
+        with self.cond:
+            self._extract.pop(cid, None)
+            self.cond.notify_all()
+
+    def set_rife_ready(self, cid: int, nbytes: int) -> tuple[int, int]:
+        with self.cond:
+            self._rife_ready[cid] = nbytes
+            self.cond.notify_all()
+            return self.extract_total(), self.rife_ready_total()
+
+    def clear_rife_ready(self, cid: int):
+        with self.cond:
+            self._rife_ready.pop(cid, None)
+            self.cond.notify_all()
+
+    def wait_for_rife_room(self, extra_bytes: int = 0) -> tuple[int, int]:
+        with self.cond:
+            while (
+                self.rife_ready_total() + extra_bytes > C.MAX_RIFE_READY_BYTES
+            ) and not C.shutdown.is_set():
+                self.cond.wait(timeout=C.RIFE_POLL_SECONDS)
+            return self.extract_total(), self.rife_ready_total()
+
+    def snapshot(self) -> tuple[int, int]:
+        with self.cond:
+            return self.extract_total(), self.rife_ready_total()
+
+
+class _MetricsStore:
+    __slots__ = ("enabled", "lock", "path", "records")
+
+    def __init__(self, work: Path):
+        self.enabled = C.ENABLE_JSONL_METRICS
+        self.lock = threading.Lock()
+        self.path = work / "chunk_metrics.jsonl"
+        self.records: dict[int, dict] = {}
+
+    def update(self, cid: int, **fields):
+        with self.lock:
+            record = self.records.setdefault(cid, {"chunk": cid})
+            record.update(fields)
+
+    def emit(self, cid: int):
+        if not self.enabled:
+            return
+        with self.lock:
+            record = self.records.pop(cid, None)
+        if not record:
+            return
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def snapshot(self, cid: int) -> dict:
+        with self.lock:
+            return dict(self.records.get(cid, {}))
+
+
 def _tmpfs_chunk(cid: int) -> Path:
     """Return tmpfs path for a chunk's intermediate frames."""
     return Path(C.TMPFS_WORK) / f"chunk_{cid:04d}"
@@ -48,7 +143,8 @@ class _ReorderWriter:
     MAX_BUFFERED = C.NVENC_STREAM_BUFFER
 
     __slots__ = ("pipe", "lock", "cond", "buf", "next_idx", "total",
-                 "written", "_finished", "_writer_thread", "_error", "_sem")
+                 "written", "_finished", "_writer_thread", "_error", "_sem",
+                 "_buffered", "max_buffered")
 
     def __init__(self, pipe_stdin, total: int):
         self.pipe = pipe_stdin
@@ -61,6 +157,8 @@ class _ReorderWriter:
         self._finished = False
         self._error: Exception | None = None
         self._sem = threading.Semaphore(self.MAX_BUFFERED)
+        self._buffered = 0
+        self.max_buffered = 0
         self._writer_thread = threading.Thread(
             target=self._writer_loop, daemon=True, name="nvenc-writer")
         self._writer_thread.start()
@@ -71,6 +169,9 @@ class _ReorderWriter:
         arr = frame if frame.flags.c_contiguous else np.ascontiguousarray(frame)
         with self.cond:
             self.buf[idx] = arr
+            self._buffered += 1
+            if self._buffered > self.max_buffered:
+                self.max_buffered = self._buffered
             if idx == self.next_idx:
                 self.cond.notify()
 
@@ -85,6 +186,7 @@ class _ReorderWriter:
                 while self.next_idx in self.buf:
                     batch.append(self.buf.pop(self.next_idx))
                     self.next_idx += 1
+                    self._buffered -= 1
                 done = self._finished and self.next_idx not in self.buf
                 self.lock.release()
                 for arr in batch:
@@ -120,6 +222,10 @@ class _ReorderWriter:
             raise RuntimeError(
                 f"ReorderWriter left {orphaned} orphan frames waiting for missing indices"
             )
+
+    def buffered_frames(self) -> int:
+        with self.lock:
+            return self._buffered
 
 
 def _open_nvenc_pipe(out_file: Path, w: int, h: int, fps: float,
@@ -228,18 +334,54 @@ def _load_png_window(paths: list[Path]) -> list[np.ndarray]:
 
 def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_in: Path,
                                  out_file: Path, fps: float, gpu: int,
-                                 cid: int, w: int, h: int) -> tuple[int, float, float, float]:
+                                 cid: int, w: int, h: int,
+                                 budget: _BudgetController | None = None,
+                                 metrics: _MetricsStore | None = None) -> dict[str, float]:
     """Run RIFE asynchronously and feed ready windows into ESRGAN/NVENC."""
     if out_file.exists() and out_file.stat().st_size > 1000:
-        return 0, 0.0, 0.0, 0.0
+        if budget is not None:
+            budget.clear_rife_ready(cid)
+            budget.release_extract(cid)
+        shutil.rmtree(rife_in, ignore_errors=True)
+        return {
+            "produced": 0,
+            "total_seconds": 0.0,
+            "rife_seconds": 0.0,
+            "readback_seconds": 0.0,
+            "encode_tail_seconds": 0.0,
+            "window_count": 0,
+            "window_avg_frames": 0.0,
+            "window_max_frames": 0,
+            "rife_ready_peak_bytes": 0,
+            "extract_peak_bytes": 0,
+            "nvenc_peak_frames": 0,
+        }
 
     n_in = len(list(rife_in.glob("*.png")))
     expected = expected_output_frames(n_in)
     if expected == 0:
-        return 0, 0.0, 0.0, 0.0
+        if budget is not None:
+            budget.clear_rife_ready(cid)
+            budget.release_extract(cid)
+        shutil.rmtree(rife_in, ignore_errors=True)
+        return {
+            "produced": 0,
+            "total_seconds": 0.0,
+            "rife_seconds": 0.0,
+            "readback_seconds": 0.0,
+            "encode_tail_seconds": 0.0,
+            "window_count": 0,
+            "window_avg_frames": 0.0,
+            "window_max_frames": 0,
+            "rife_ready_peak_bytes": 0,
+            "extract_peak_bytes": 0,
+            "nvenc_peak_frames": 0,
+        }
 
     rife_out = rife_in.parent / "rife"
     shutil.rmtree(rife_out, ignore_errors=True)
+    frame_nbytes = _frame_bytes(w, h)
+    window_cap = max(1, min(C.RIFE_STREAM_WINDOW, C.MAX_ESRGAN_READY_FRAMES))
 
     nvenc = _open_nvenc_pipe(out_file, w * esr.output_scale, h * esr.output_scale, fps, gpu)
     writer = _ReorderWriter(nvenc.stdin, expected)
@@ -248,7 +390,14 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_in: Path,
     t0 = time.time()
     t_rife = time.time()
     read_dt = 0.0
+    encode_tail_dt = 0.0
     next_idx = 0
+    window_count = 0
+    window_total = 0
+    window_max = 0
+    rife_ready_peak = 0
+    extract_peak = 0
+    esr_stats: dict[str, float] = {}
 
     try:
         while next_idx < expected:
@@ -257,8 +406,7 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_in: Path,
                     rife_proc.terminate()
                 break
 
-            limit = expected if rife_proc.poll() is not None else min(
-                expected, next_idx + C.RIFE_STREAM_WINDOW)
+            limit = min(expected, next_idx + window_cap)
             now = time.time()
             ready_paths: list[Path] = []
             probe = next_idx
@@ -275,10 +423,25 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_in: Path,
                 ready_paths.append(path)
                 probe += 1
 
+            ready_bytes = len(ready_paths) * frame_nbytes
+            if budget is not None:
+                extract_total, rife_ready_total = budget.set_rife_ready(cid, ready_bytes)
+                extract_peak = max(extract_peak, extract_total)
+                rife_ready_peak = max(rife_ready_peak, rife_ready_total)
+
             ready_enough = len(ready_paths) >= C.RIFE_MIN_WINDOW or (
                 rife_proc.poll() is not None and len(ready_paths) > 0
             )
             if ready_enough:
+                if budget is not None:
+                    extract_total, rife_ready_total = budget.wait_for_rife_room()
+                    extract_peak = max(extract_peak, extract_total)
+                    rife_ready_peak = max(rife_ready_peak, rife_ready_total)
+                while (
+                    writer.buffered_frames() >= C.MAX_NVENC_BUFFERED_FRAMES
+                    and not C.shutdown.is_set()
+                ):
+                    time.sleep(C.RIFE_POLL_SECONDS)
                 t_read = time.time()
                 frames = _load_png_window(ready_paths)
                 read_dt += time.time() - t_read
@@ -292,6 +455,7 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_in: Path,
                     frames,
                     lambda idx, frame, base=offset: writer.on_frame(base + idx, frame),
                     log_progress=False,
+                    telemetry=esr_stats,
                 )
                 if produced != ready_count:
                     raise RuntimeError(
@@ -299,8 +463,16 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_in: Path,
                     )
 
                 next_idx += ready_count
+                window_count += 1
+                window_total += ready_count
+                window_max = max(window_max, ready_count)
                 for path in ready_paths[:ready_count]:
                     path.unlink(missing_ok=True)
+                if budget is not None:
+                    extract_total, _ = budget.set_rife_ready(
+                        cid, max(len(ready_paths) - ready_count, 0) * frame_nbytes
+                    )
+                    extract_peak = max(extract_peak, extract_total)
                 continue
 
             rc = rife_proc.poll()
@@ -316,10 +488,12 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_in: Path,
         if rc != 0 and not C.shutdown.is_set():
             raise RuntimeError(f"RIFE failed for chunk {cid:04d} (rc={rc})")
 
+        t_tail = time.time()
         writer.flush_remaining()
         with suppress(BrokenPipeError, OSError, ValueError):
             nvenc.stdin.close()
         nvenc.wait()
+        encode_tail_dt = time.time() - t_tail
     except Exception:
         with suppress(Exception):
             rife_proc.kill()
@@ -333,6 +507,9 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_in: Path,
             nvenc.wait(timeout=5)
         raise
     finally:
+        if budget is not None:
+            budget.clear_rife_ready(cid)
+            budget.release_extract(cid)
         shutil.rmtree(rife_in, ignore_errors=True)
         shutil.rmtree(rife_out, ignore_errors=True)
 
@@ -340,7 +517,24 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_in: Path,
         raise RuntimeError(f"NVENC streaming encode failed (rc={nvenc.returncode})")
 
     total_dt = time.time() - t0
-    return writer.written, total_dt, rife_dt, read_dt
+    stats = {
+        "produced": writer.written,
+        "total_seconds": total_dt,
+        "rife_seconds": rife_dt,
+        "readback_seconds": read_dt,
+        "encode_tail_seconds": encode_tail_dt,
+        "window_count": window_count,
+        "window_avg_frames": (window_total / window_count) if window_count else 0.0,
+        "window_max_frames": window_max,
+        "rife_ready_peak_bytes": rife_ready_peak,
+        "extract_peak_bytes": extract_peak,
+        "nvenc_peak_frames": writer.max_buffered,
+    }
+    for key, value in esr_stats.items():
+        stats[f"esrgan_{key}_seconds"] = value
+    if metrics is not None:
+        metrics.update(cid, **stats)
+    return stats
 
 
 def _write_pngs(frames: list[np.ndarray], out_dir: Path):
@@ -360,8 +554,11 @@ def _write_pngs(frames: list[np.ndarray], out_dir: Path):
 
 
 def extract_worker(chunks, src: Path, w: int, h: int, fps: float,
-                   do_rife: bool, prog: Progress, out_q: queue.Queue):
+                   do_rife: bool, prog: Progress, out_q: queue.Queue,
+                   budget: _BudgetController | None,
+                   metrics: _MetricsStore | None):
     """Stage 1: extract directly to the format the next stage needs."""
+    frame_nbytes = _frame_bytes(w, h)
     for cid, start, dur in chunks:
         if C.shutdown.is_set():
             break
@@ -376,8 +573,31 @@ def extract_worker(chunks, src: Path, w: int, h: int, fps: float,
         if do_rife:
             raw_dir = _tmpfs_chunk(cid) / "raw"
             shutil.rmtree(raw_dir, ignore_errors=True)
-            n = extract_frames(src, start, dur, raw_dir, fps)
+            reserved = max(1, int(round(dur * fps))) * frame_nbytes
+            extract_peak = 0
+            try:
+                if budget is not None:
+                    extract_total, _ = budget.reserve_extract(cid, reserved)
+                    extract_peak = max(extract_peak, extract_total)
+                n = extract_frames(src, start, dur, raw_dir, fps)
+                actual_bytes = n * frame_nbytes
+                if budget is not None:
+                    extract_total, _ = budget.update_extract(cid, actual_bytes)
+                    extract_peak = max(extract_peak, extract_total)
+            except Exception:
+                if budget is not None:
+                    budget.release_extract(cid)
+                raise
             dt = time.time() - t0
+            if metrics is not None:
+                metrics.update(
+                    cid,
+                    extract_seconds=dt,
+                    extract_frames=n,
+                    extract_fps=(n / dt) if dt > 0 else 0.0,
+                    extract_bytes=actual_bytes,
+                    extract_peak_bytes=extract_peak,
+                )
             print(
                 f"  [Extract→RIFE PNG] chunk {cid:04d}: "
                 f"{n} frames ({dt:.1f}s, {n/dt:.0f}fps)",
@@ -391,6 +611,14 @@ def extract_worker(chunks, src: Path, w: int, h: int, fps: float,
         dt = time.time() - t0
         if frames:
             n = len(frames)
+            if metrics is not None:
+                metrics.update(
+                    cid,
+                    extract_seconds=dt,
+                    extract_frames=n,
+                    extract_fps=(n / dt) if dt > 0 else 0.0,
+                    extract_bytes=n * frame_nbytes,
+                )
             print(f"  [Extract] chunk {cid:04d}: {n} frames ({dt:.1f}s, {n/dt:.0f}fps)", flush=True)
         prog.mark(cid, "extract")
 
@@ -399,7 +627,10 @@ def extract_worker(chunks, src: Path, w: int, h: int, fps: float,
 
 
 def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
-                      in_q: queue.Queue, out_q: queue.Queue):
+                      in_q: queue.Queue, out_q: queue.Queue,
+                      budget: _BudgetController | None,
+                      metrics: _MetricsStore | None,
+                      w: int, h: int):
     """Stage 2 (NEW ORDER): RIFE interpolation at ORIGINAL resolution (1260p, 3.8x faster than 4K).
     
     Receives raw extracted frames, writes them as PNGs, runs RIFE Vulkan, 
@@ -444,6 +675,13 @@ def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
         n = rife_interpolate(rife_in, rife_out)
         prog.mark(cid, "rife")
         dt = time.time() - tr
+        if metrics is not None:
+            metrics.update(
+                cid,
+                rife_seconds=dt,
+                rife_frames=n,
+                rife_fps=(n / dt) if dt > 0 else 0.0,
+            )
         print(f"  | RIFE (1260p): {n} frames  ({dt:.1f}s, {n/dt:.1f}fps) chunk {cid:04d}", flush=True)
         shutil.rmtree(rife_in, ignore_errors=True)
 
@@ -461,6 +699,13 @@ def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
         dt_read = time.time() - tread
         interp_frames = [f for f in interp_frames if f is not None]
         if interp_frames:
+            if metrics is not None:
+                metrics.update(
+                    cid,
+                    readback_seconds=dt_read,
+                    readback_frames=len(interp_frames),
+                    readback_fps=(len(interp_frames) / dt_read) if dt_read > 0 else 0.0,
+                )
             print(
                 f"  | RIFE readback: {len(interp_frames)} frames "
                 f"({dt_read:.1f}s, {len(interp_frames)/dt_read:.1f}fps) chunk {cid:04d}",
@@ -468,6 +713,8 @@ def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
             )
         
         # Cleanup RIFE tmpfs
+        if budget is not None:
+            budget.release_extract(cid)
         shutil.rmtree(_tmpfs_chunk(cid), ignore_errors=True)
         
         out_q.put((cid, interp_frames))
@@ -489,7 +736,9 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                   in_q: queue.Queue, out_q: queue.Queue,
                   total: int, done_n: int, t_start: float,
                   counter: list[int], lock: threading.Lock,
-                  w: int, h: int):
+                  w: int, h: int,
+                  budget: _BudgetController | None,
+                  metrics: _MetricsStore | None):
     """Stage 3: upscale frames and queue them for encode."""
     while True:
         item = in_q.get()
@@ -523,31 +772,66 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
         if do_esr and esr and do_rife and raw_dir is not None:
             gpu = C.NVENC_GPUS[cid % len(C.NVENC_GPUS)]
             expected = expected_output_frames(len(list(raw_dir.glob("*.png"))))
-            produced, dt_total, dt_rife, dt_read = _stream_rife_esrgan_to_nvenc(
-                esr, raw_dir, vid, out_fps, gpu, cid, w, h)
+            stats = _stream_rife_esrgan_to_nvenc(
+                esr, raw_dir, vid, out_fps, gpu, cid, w, h, budget, metrics)
             prog.mark(cid, "rife")
             prog.mark(cid, "esrgan")
             prog.mark(cid, "encode")
             prog.mark(cid, "clean")
+            produced = int(stats["produced"])
+            dt_total = stats["total_seconds"]
+            dt_rife = stats["rife_seconds"]
+            dt_read = stats["readback_seconds"]
             if produced != expected and not C.shutdown.is_set():
                 raise RuntimeError(
                     f"Streaming RIFE/ESRGAN/NVENC produced {produced} frames, expected {expected}"
                 )
+            if metrics is not None:
+                metrics.update(
+                    cid,
+                    rife_seconds=dt_rife,
+                    rife_frames=expected,
+                    rife_fps=(expected / dt_rife) if dt_rife > 0 else 0.0,
+                    readback_seconds=dt_read,
+                    readback_frames=expected,
+                    readback_fps=(expected / dt_read) if dt_read > 0 else 0.0,
+                    esrgan_seconds=sum(
+                        float(stats.get(key, 0.0))
+                        for key in (
+                            "esrgan_fill_seconds",
+                            "esrgan_h2d_seconds",
+                            "esrgan_downscale_seconds",
+                            "esrgan_infer_seconds",
+                            "esrgan_d2h_seconds",
+                        )
+                    ),
+                    encode_seconds=float(stats.get("esrgan_writer_wait_seconds", 0.0))
+                    + float(stats.get("encode_tail_seconds", 0.0)),
+                    effective_fps=(produced / dt_total) if dt_total > 0 else 0.0,
+                )
+            record = metrics.snapshot(cid) if metrics is not None else {}
             print(
-                f"  | RIFE (1260p): {expected} frames  ({dt_rife:.1f}s, {expected/dt_rife:.1f}fps) chunk {cid:04d}",
+                f"  [Chunk {cid:04d} summary] "
+                f"extract={record.get('extract_seconds', 0.0):.1f}s "
+                f"rife={dt_rife:.1f}s ({record.get('rife_fps', 0.0):.1f}fps) "
+                f"read={dt_read:.1f}s ({record.get('readback_fps', 0.0):.1f}fps) "
+                f"esr={record.get('esrgan_seconds', 0.0):.1f}s "
+                f"encode={record.get('encode_seconds', 0.0):.1f}s "
+                f"total={dt_total:.1f}s "
+                f"win_avg={stats['window_avg_frames']:.1f} "
+                f"win_max={int(stats['window_max_frames'])} "
+                f"backlog_extract={stats['extract_peak_bytes'] / 1024**3:.2f}GiB "
+                f"backlog_rife={stats['rife_ready_peak_bytes'] / 1024**3:.2f}GiB "
+                f"nvenc_buf={int(stats['nvenc_peak_frames'])}",
                 flush=True,
             )
-            if dt_read > 0:
-                print(
-                    f"  | RIFE readback (windowed): {expected} frames "
-                    f"({dt_read:.1f}s, {expected/dt_read:.1f}fps) chunk {cid:04d}",
-                    flush=True,
-                )
             print(
                 f"  [RIFE→ESRGAN→NVENC@GPU{gpu}] chunk {cid:04d}: "
                 f"{produced} frames ({dt_total:.1f}s, {produced/dt_total:.1f}fps)",
                 flush=True,
             )
+            if metrics is not None:
+                metrics.emit(cid)
             _report_progress(total, done_n, counter, lock, t_start)
             continue
 
@@ -566,6 +850,14 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                 )
             prog.mark(cid, "encode")
             prog.mark(cid, "clean")
+            if metrics is not None:
+                metrics.update(
+                    cid,
+                    esrgan_seconds=dt_esr,
+                    encode_seconds=dt_esr,
+                    effective_fps=(n / dt_esr) if dt_esr > 0 else 0.0,
+                )
+                metrics.emit(cid)
             print(
                 f"  [ESRGAN→NVENC@GPU{gpu}] chunk {cid:04d}: "
                 f"{n} frames ({dt_esr:.1f}s, {n/dt_esr:.1f}fps)",
@@ -582,7 +874,8 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
 
 def encode_worker(worker_idx: int, gpu: int, prog: Progress,
                   in_q: queue.Queue, total: int, done_n: int,
-                  t_start: float, counter: list[int], lock: threading.Lock):
+                  t_start: float, counter: list[int], lock: threading.Lock,
+                  metrics: _MetricsStore | None):
     """Stage 4: encode queued numpy frames with a dedicated NVENC device."""
     label = f"NVENC{worker_idx}@GPU{gpu}"
     while True:
@@ -628,6 +921,15 @@ def encode_worker(worker_idx: int, gpu: int, prog: Progress,
 
         prog.mark(cid, "encode")
         prog.mark(cid, "clean")
+        if metrics is not None:
+            metrics.update(
+                cid,
+                encode_seconds=dt,
+                encode_frames=n,
+                encode_fps=(n / dt) if dt > 0 else 0.0,
+                effective_fps=(n / dt) if dt > 0 else 0.0,
+            )
+            metrics.emit(cid)
         print(f"  [{label}] chunk {cid:04d}: {n} frames ({dt:.1f}s, {n/dt:.1f}fps)", flush=True)
         _report_progress(total, done_n, counter, lock, t_start)
 
@@ -645,9 +947,11 @@ def run(chunks, src: Path, work: Path, prog: Progress,
         return done_n
 
     Path(C.TMPFS_WORK).mkdir(parents=True, exist_ok=True)
+    budget = _BudgetController()
+    metrics = _MetricsStore(work)
     q_extract = queue.Queue(maxsize=C.PIPELINE_DEPTH)
     q_rife = queue.Queue(maxsize=C.PIPELINE_DEPTH)
-    q_encode = queue.Queue(maxsize=1)
+    q_encode = queue.Queue(maxsize=max(C.PIPELINE_DEPTH, 1))
     direct_rife_stream = do_rife and do_esr
 
     t_start = time.time()
@@ -666,9 +970,33 @@ def run(chunks, src: Path, work: Path, prog: Progress,
                 C.shutdown.set()
         return threading.Thread(target=runner, name=name)
 
-    t_ext = spawn("Extractor Thread", extract_worker, pending, src, w, h, fps, do_rife, prog, q_extract)
+    t_ext = spawn(
+        "Extractor Thread",
+        extract_worker,
+        pending,
+        src,
+        w,
+        h,
+        fps,
+        do_rife,
+        prog,
+        q_extract,
+        budget,
+        metrics,
+    )
     t_rife = None if direct_rife_stream else spawn(
-        "RIFE Interpolator (1260p)", rife_first_worker, do_rife, fps, prog, q_extract, q_rife)
+        "RIFE Interpolator (1260p)",
+        rife_first_worker,
+        do_rife,
+        fps,
+        prog,
+        q_extract,
+        q_rife,
+        budget,
+        metrics,
+        w,
+        h,
+    )
     t_esr = spawn(
         "ESRGAN Upscaler",
         esrgan_worker,
@@ -687,13 +1015,15 @@ def run(chunks, src: Path, work: Path, prog: Progress,
         encode_lock,
         w,
         h,
+        budget,
+        metrics,
     )
     encode_threads = [
         spawn(
             f"NVENC Worker {idx}",
             encode_worker,
             idx, gpu, prog, q_encode, total, done_n, t_start,
-            encode_counter, encode_lock,
+            encode_counter, encode_lock, metrics,
         )
         for idx, gpu in enumerate(C.NVENC_GPUS)
     ]

@@ -11,19 +11,31 @@ export ENHANCE_ESRGAN_GPUS="${ENHANCE_ESRGAN_GPUS:-0}"
 export ENHANCE_NVENC_GPUS="${ENHANCE_NVENC_GPUS:-0}"
 export ENHANCE_RIFE_GPU="${ENHANCE_RIFE_GPU:-1}"
 export ENHANCE_RIFE_THREADS="${ENHANCE_RIFE_THREADS:-1:8:4}"
+export ENHANCE_RIFE_STREAM_WINDOW="${ENHANCE_RIFE_STREAM_WINDOW:-192}"
+export ENHANCE_RIFE_MIN_WINDOW="${ENHANCE_RIFE_MIN_WINDOW:-64}"
+export ENHANCE_RIFE_POLL_SECONDS="${ENHANCE_RIFE_POLL_SECONDS:-0.05}"
+export ENHANCE_RIFE_FILE_SETTLE_SECONDS="${ENHANCE_RIFE_FILE_SETTLE_SECONDS:-0.05}"
 export ENHANCE_NVENC_STREAM_BUFFER="${ENHANCE_NVENC_STREAM_BUFFER:-8}"
+export ENHANCE_MAX_ESRGAN_READY_FRAMES="${ENHANCE_MAX_ESRGAN_READY_FRAMES:-192}"
+export ENHANCE_MAX_NVENC_BUFFERED_FRAMES="${ENHANCE_MAX_NVENC_BUFFERED_FRAMES:-8}"
+export ENHANCE_MAX_EXTRACT_BYTES_IN_FLIGHT="${ENHANCE_MAX_EXTRACT_BYTES_IN_FLIGHT:-6442450944}"
+export ENHANCE_MAX_RIFE_READY_BYTES="${ENHANCE_MAX_RIFE_READY_BYTES:-3221225472}"
+export ENHANCE_ENABLE_JSONL_METRICS="${ENHANCE_ENABLE_JSONL_METRICS:-1}"
+export ENHANCE_ESRGAN_PINNED_STAGING="${ENHANCE_ESRGAN_PINNED_STAGING:-0}"
 
 run_video() {
   local input="$1"
+  shift || true
   local name
   name="$(basename "$input")"
   local logfile="$LOGDIR/${name%.*}_production.log"
 
   echo "[$(date --iso-8601=seconds)] START $name" | tee -a "$logfile"
   stdbuf -oL -eL python3 "$ROOT/scripts/run.py" "$input" --outdir "$OUTDIR" \
+    "$@" \
     2>&1 | tee -a "$logfile"
   echo "[$(date --iso-8601=seconds)] END $name" | tee -a "$logfile"
 }
 
 run_video "$ROOT/videos/GMT20260320-130023_Recording_2240x1260.mp4"
-run_video "$ROOT/videos/GMT20260320-130023_Recording_gallery_2240x1260.mp4"
+run_video "$ROOT/videos/GMT20260320-130023_Recording_gallery_2240x1260.mp4" --clean

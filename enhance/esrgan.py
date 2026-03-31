@@ -2,8 +2,9 @@
 ESRGAN engine — dual-GPU batched inference + CPU Multi-Thread inference.
 
 Key optimizations:
-  - Dynamic Task Allocation: GPUs and CPU independently pull frame indexes avoiding static blocks.
-  - Double-buffered pinned memory: Preps batch N+1 while GPU runs batch N dynamically.
+  - Dynamic task allocation across workers.
+  - Reusable CPU batch buffers to avoid per-batch np.stack allocations.
+  - Pinned CPU staging + split CUDA streams for H2D and compute telemetry.
 """
 import time, threading
 from pathlib import Path
@@ -109,11 +110,17 @@ class ESRGANEngine:
                     frames: list[np.ndarray], get_batch: Callable,
                     store: list | None, on_frame: Callable | None,
                     counter: list, lock: threading.Lock, total: int, t0: float,
-                    log_progress: bool):
+                    log_progress: bool,
+                    telemetry: dict[str, float] | None,
+                    telemetry_lock: threading.Lock):
         torch = self.torch
         net = self.models[worker_idx]
         dev = f"cuda:{dev_id}"
         bs = self.batches[worker_idx]
+        copy_stream = torch.cuda.Stream(device=dev_id) if C.ESRGAN_EXPERIMENTAL_PINNED_STAGING else None
+        compute_stream = torch.cuda.Stream(device=dev_id) if C.ESRGAN_EXPERIMENTAL_PINNED_STAGING else None
+        batch_buf = None
+        cpu_stage = None
 
         while True:
             if C.shutdown.is_set():
@@ -124,34 +131,120 @@ class ESRGANEngine:
                 break
             cur_bs = end - start
 
-            batch_np = np.stack([frames[start + i] for i in range(cur_bs)])
-            t_gpu = (
-                torch.from_numpy(batch_np)
-                .permute(0, 3, 1, 2)
-                .to(dev, dtype=torch.float16, non_blocking=True)
-                / 255.0
-            )
+            if C.ESRGAN_EXPERIMENTAL_PINNED_STAGING:
+                frame0 = frames[start]
+                if (
+                    batch_buf is None
+                    or batch_buf.shape[0] != bs
+                    or batch_buf.shape[1:] != frame0.shape
+                ):
+                    h, w = frame0.shape[:2]
+                    batch_buf = np.empty((bs, h, w, 3), dtype=np.uint8)
+                    cpu_stage = torch.empty(
+                        (bs, 3, h, w), dtype=torch.float16, pin_memory=True
+                    )
 
-            t_small = torch.nn.functional.interpolate(
-                t_gpu, scale_factor=0.5,
-                mode="bilinear", align_corners=False)
+                fill_t0 = time.time()
+                for i in range(cur_bs):
+                    batch_buf[i, ...] = frames[start + i]
+                fill_dt = time.time() - fill_t0
 
-            with torch.inference_mode():
-                out = net(t_small)
+                h2d_start = torch.cuda.Event(enable_timing=True)
+                h2d_end = torch.cuda.Event(enable_timing=True)
+                downscale_start = torch.cuda.Event(enable_timing=True)
+                downscale_end = torch.cuda.Event(enable_timing=True)
+                infer_start = torch.cuda.Event(enable_timing=True)
+                infer_end = torch.cuda.Event(enable_timing=True)
+                d2h_start = torch.cuda.Event(enable_timing=True)
+                d2h_end = torch.cuda.Event(enable_timing=True)
 
-            out_u8 = (out.clamp(0, 1) * 255).byte()
-            out_cpu = out_u8.permute(0, 2, 3, 1).contiguous().cpu()
-            torch.cuda.synchronize(dev_id)
+                cpu_batch = torch.from_numpy(batch_buf[:cur_bs]).permute(0, 3, 1, 2)
+                cpu_stage[:cur_bs].copy_(cpu_batch)
+
+                with torch.cuda.stream(copy_stream):
+                    h2d_start.record()
+                    t_gpu = cpu_stage[:cur_bs].to(dev, non_blocking=True)
+                    t_gpu = t_gpu.mul_(1.0 / 255.0)
+                    h2d_end.record()
+
+                with torch.cuda.stream(compute_stream):
+                    compute_stream.wait_stream(copy_stream)
+                    downscale_start.record()
+                    t_small = torch.nn.functional.interpolate(
+                        t_gpu, scale_factor=0.5,
+                        mode="bilinear", align_corners=False)
+                    downscale_end.record()
+
+                    infer_start.record()
+                    with torch.inference_mode():
+                        out = net(t_small)
+                    infer_end.record()
+
+                    out_u8 = (out.clamp(0, 1) * 255).byte()
+                    d2h_start.record()
+                    out_cpu = out_u8.permute(0, 2, 3, 1).contiguous().cpu()
+                    d2h_end.record()
+
+                compute_stream.synchronize()
+                h2d_dt = h2d_start.elapsed_time(h2d_end) / 1000.0
+                downscale_dt = downscale_start.elapsed_time(downscale_end) / 1000.0
+                infer_dt = infer_start.elapsed_time(infer_end) / 1000.0
+                d2h_dt = d2h_start.elapsed_time(d2h_end) / 1000.0
+            else:
+                fill_t0 = time.time()
+                batch_np = np.stack([frames[start + i] for i in range(cur_bs)])
+                fill_dt = time.time() - fill_t0
+
+                h2d_t0 = time.time()
+                t_gpu = (
+                    torch.from_numpy(batch_np)
+                    .permute(0, 3, 1, 2)
+                    .to(dev, dtype=torch.float16, non_blocking=True)
+                    / 255.0
+                )
+                h2d_dt = time.time() - h2d_t0
+
+                downscale_t0 = time.time()
+                t_small = torch.nn.functional.interpolate(
+                    t_gpu, scale_factor=0.5,
+                    mode="bilinear", align_corners=False)
+                downscale_dt = time.time() - downscale_t0
+
+                infer_t0 = time.time()
+                with torch.inference_mode():
+                    out = net(t_small)
+                infer_dt = time.time() - infer_t0
+
+                d2h_t0 = time.time()
+                out_u8 = (out.clamp(0, 1) * 255).byte()
+                out_cpu = out_u8.permute(0, 2, 3, 1).contiguous().cpu()
+                torch.cuda.synchronize(dev_id)
+                d2h_dt = time.time() - d2h_t0
 
             out_np = out_cpu.numpy()
+            writer_wait_dt = 0.0
             for i in range(cur_bs):
                 gidx = start + i
                 if store is not None:
                     store[gidx] = out_np[i]
                 if on_frame is not None:
+                    write_t0 = time.time()
                     on_frame(gidx, out_np[i])
+                    writer_wait_dt += time.time() - write_t0
 
-            del batch_np, t_gpu, t_small, out, out_u8, out_cpu
+            if telemetry is not None:
+                with telemetry_lock:
+                    telemetry["fill"] = telemetry.get("fill", 0.0) + fill_dt
+                    telemetry["h2d"] = telemetry.get("h2d", 0.0) + h2d_dt
+                    telemetry["downscale"] = telemetry.get("downscale", 0.0) + downscale_dt
+                    telemetry["infer"] = telemetry.get("infer", 0.0) + infer_dt
+                    telemetry["d2h"] = telemetry.get("d2h", 0.0) + d2h_dt
+                    telemetry["writer_wait"] = telemetry.get("writer_wait", 0.0) + writer_wait_dt
+
+            if C.ESRGAN_EXPERIMENTAL_PINNED_STAGING:
+                del cpu_batch, t_gpu, t_small, out, out_u8, out_cpu
+            else:
+                del batch_np, t_gpu, t_small, out, out_u8, out_cpu
 
             with lock:
                 counter[0] += cur_bs
@@ -168,7 +261,9 @@ class ESRGANEngine:
     def _cpu_worker(self, frames: list[np.ndarray], get_batch: Callable,
                     store: list | None, on_frame: Callable | None,
                     counter: list, lock: threading.Lock, total: int, t0: float,
-                    log_progress: bool):
+                    log_progress: bool,
+                    telemetry: dict[str, float] | None,
+                    telemetry_lock: threading.Lock):
         torch = self.torch
         net = self.cpu_model
 
@@ -180,6 +275,7 @@ class ESRGANEngine:
                 return
             
             frame = frames[start]
+            batch_t0 = time.time()
             t_cpu = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0).to("cpu", dtype=torch.float32) / 255.0
 
             t_small = torch.nn.functional.interpolate(
@@ -198,6 +294,10 @@ class ESRGANEngine:
             if on_frame is not None:
                 on_frame(gidx, out_cpu_frame)
 
+            if telemetry is not None:
+                with telemetry_lock:
+                    telemetry["cpu"] = telemetry.get("cpu", 0.0) + (time.time() - batch_t0)
+
             with lock:
                 counter[0] += 1
                 c = counter[0]
@@ -214,7 +314,8 @@ class ESRGANEngine:
     def _run_parallel(self, frames: list[np.ndarray],
                       store: list | None,
                       on_frame: Callable | None,
-                      log_progress: bool = True) -> int:
+                      log_progress: bool = True,
+                      telemetry: dict[str, float] | None = None) -> int:
         """Dispatch dynamically fetching threads."""
         total = len(frames)
         if total == 0:
@@ -222,6 +323,7 @@ class ESRGANEngine:
 
         pos = [0]
         lock = threading.Lock()
+        telemetry_lock = threading.Lock()
         
         def get_batch(batch_size):
             with lock:
@@ -263,6 +365,8 @@ class ESRGANEngine:
             total,
             t0,
             log_progress,
+            telemetry,
+            telemetry_lock,
         )
         
         # Deploy fetching worker for GPU1 (Slightly Slower: Pulls 4 frames automatically)
@@ -280,6 +384,8 @@ class ESRGANEngine:
                 total,
                 t0,
                 log_progress,
+                telemetry,
+                telemetry_lock,
             )
             
         # Deploy fetching worker for CPU (R9 Processor: Pulls 1 frame slowly behind them)
@@ -295,6 +401,8 @@ class ESRGANEngine:
                 total,
                 t0,
                 log_progress,
+                telemetry,
+                telemetry_lock,
             )
 
         for t in threads:
@@ -336,6 +444,12 @@ class ESRGANEngine:
 
     def process_streaming(self, frames: list[np.ndarray],
                           on_frame: Callable[[int, np.ndarray], None],
-                          log_progress: bool = True) -> int:
+                          log_progress: bool = True,
+                          telemetry: dict[str, float] | None = None) -> int:
         return self._run_parallel(
-            frames, store=None, on_frame=on_frame, log_progress=log_progress)
+            frames,
+            store=None,
+            on_frame=on_frame,
+            log_progress=log_progress,
+            telemetry=telemetry,
+        )

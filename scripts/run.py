@@ -111,7 +111,7 @@ def main():
     print(f"  Frames: ~{total_frames:,}  |  Chunks: {args.chunk}s each")
     print(f"  ESRGAN: {'ON' if do_esr else 'SKIP'}  |  RIFE: {'ON' if do_rife else 'SKIP'}")
     print(f"  Audio:  {'ENHANCE' if (audio_src and not args.skip_audio) else ('COPY' if audio_src else 'NONE')}")
-    print(f"  Tmpfs:  {C.TMPFS_WORK}  (frames in RAM, zero disk I/O)")
+    print(f"  Tmpfs:  {C.TMPFS_WORK}  (PNG intermedios en tmpfs + ventanas en RAM)")
     print("=" * 60)
 
     prog = Progress(work)
