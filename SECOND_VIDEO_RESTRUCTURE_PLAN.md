@@ -20,6 +20,59 @@ No se considera éxito:
 - generar CPU spin o RAM muerta solo para “ver uso”
 - perseguir bloques que no aportan al problema, como `RT cores`
 
+## 1.1 Resumen Ejecutivo del Estudio
+
+Este es el resultado directo del estudio actual del pipeline.
+
+| Área | Estado actual | Conclusión dura |
+|---|---|---|
+| calidad visual | texto y fluidez mejoraron, caras no | la calidad facial actual no es aceptable como salida final |
+| calidad de audio | mejor que el original, pero procesada de más | la cadena actual de audio no está cerrada |
+| throughput | `0.38x realtime` | todavía falta para la meta mínima |
+| GPU0 | sí trabaja fuerte, pero no sostenida todo el tiempo | está subalimentada por la arquitectura del pipeline |
+| GPU1 | solo se aprovecha de verdad por Vulkan para `RIFE` | la tarjeta sigue lejos de estar explotada como tarjeta completa |
+| CPU | `~40.1%` de uso medio | hay margen útil grande en afinidad, caché y scheduling |
+| I/O de bloque | muy bajo | el disco no es el cuello principal |
+| I/O en memoria / PNG / pipes | alto impacto | sí forma parte del cuello real |
+| PCIe GPU1 | `x4` bajo carga | posible límite físico real |
+
+## 1.2 Conclusiones Duras que Sí o Sí Debe Reflejar el Plan
+
+1. El pipeline actual no usa “toda la PC”; usa bien GPU0 y usa parcialmente GPU1 y CPU.
+2. El cuello actual no es el disco.
+3. El cuello actual tampoco es `NVENC`.
+4. El extractor real no es lento; se bloquea por backpressure downstream.
+5. El contrato por PNG sigue siendo parte central del problema de uso y de espera.
+6. La 2060 sigue demasiado desaprovechada:
+   - no usa `NVENC`
+   - no usa `NVDEC`
+   - no usa su camino CUDA/Tensor en producción
+7. La calidad actual todavía falla en dos puntos de primer nivel:
+   - rostros demasiado suavizados
+   - audio demasiado procesado
+8. Si se quiere acercarse al uso útil máximo del equipo, el plan ya no puede ser solo de tuning de `RIFE`; tiene que cubrir:
+   - calidad visual
+   - calidad de audio
+   - scheduler CPU
+   - I/O en memoria
+   - PCIe de GPU1
+   - reaprovechamiento real de GPU1
+
+## 1.3 Tabla Rápida de Uso Actual vs Meta Útil
+
+| Componente | Uso actual | Meta útil | Brecha visible |
+|---|---:|---:|---|
+| GPU0 compute | `47.4%` promedio | alto y sostenido | grande |
+| GPU0 NVENC | `4.2%` promedio | sostenido cuando encode toque | baja prioridad |
+| GPU1 compute | `55.1%` promedio, solo vía Vulkan | aprovechar más motores útiles | grande |
+| GPU1 NVENC | `0%` | abierto a uso si no daña `RIFE` | total |
+| CPU | `40.1%` promedio | `50-70%` útil y bien repartido | media |
+| CPU iowait | `~0.60%` | bajo | ya está bien |
+| disco `/home` | `md127 ~1.09%` promedio | bajo | no perseguir |
+| tmpfs `/tmp` | holgado | backlog útil, no memoria muerta | media |
+| swap | estable en `18 GiB` | estable o menor | aceptable, pero mejorable |
+| PCIe GPU1 | `x4` | idealmente `x16`, mínimo entendido | alta |
+
 ## 2. Baseline Operativo Válido
 
 Las decisiones de este plan se apoyan en el pipeline actual instrumentado y en los logs ya generados del repo.
