@@ -99,6 +99,22 @@ VISUAL_PROFILES: Dict[str, VisualProfile] = {
         hybrid_detail_weight=0.2,
         face_adaptive=True,
     ),
+    "quality": VisualProfile(
+        name="quality",
+        model_key="real_x2",
+        downscale_factor=1.0,
+        hybrid_detail_weight=0.15,
+        face_adaptive=True,
+        face_roi=(0.5, 0.0, 1.0, 0.5),  # top-right quadrant (speaker tile in Zoom)
+    ),
+    "face_preserve": VisualProfile(
+        name="face_preserve",
+        model_key="real_x2",
+        downscale_factor=1.0,
+        hybrid_detail_weight=0.25,
+        face_adaptive=True,
+        face_roi=(0.5, 0.0, 1.0, 0.5),
+    ),
 }
 
 AUDIO_PROFILES: Dict[str, AudioProfile] = {
@@ -136,7 +152,18 @@ AUDIO_PROFILES: Dict[str, AudioProfile] = {
         filter_chain=(
             "highpass=f=80,"
             "anlmdn=s=7:p=0.002:m=15,"
-            "loudnorm=I=-16:TP=-1.5:LRA=11"
+            "loudnorm=I=-16:TP=-1.5:LRA=11,"
+            "alimiter=level_in=1:level_out=1:limit=0.95:release=50"
+        ),
+    ),
+    "voice_natural": AudioProfile(
+        name="voice_natural",
+        filter_chain=(
+            "highpass=f=80,"
+            "anlmdn=s=7:p=0.002:m=15,"
+            "dialoguenhance,"
+            "loudnorm=I=-16:TP=-1.5:LRA=11,"
+            "alimiter=level_in=1:level_out=1:limit=0.95:release=50"
         ),
     ),
 }
@@ -145,17 +172,35 @@ SCHEDULER_PROFILES: Dict[str, SchedulerProfile] = {
     "baseline": SchedulerProfile(
         name="baseline",
     ),
+    # T7: CCD-aware pinning with ionice + chrt for Ryzen 9 9950X3D dual-CCD.
+    # CCD0 cores 0-7 (threads 0-7,16-23) handle I/O-heavy ffmpeg/audio;
+    # CCD1 cores 8-15 (threads 8-15,24-31) handle Python/ESRGAN work.
     "split_l3_a": SchedulerProfile(
         name="split_l3_a",
         cpuset_ffmpeg="0-7,16-23",
         cpuset_audio="0-7,16-23",
         cpuset_python="8-15,24-31",
+        ionice_class=2,
+        ionice_level=0,
+        use_chrt=True,
     ),
     "split_l3_b": SchedulerProfile(
         name="split_l3_b",
         cpuset_ffmpeg="8-15,24-31",
         cpuset_audio="8-15,24-31",
         cpuset_python="0-7,16-23",
+    ),
+    # T9: Production profile — CCD split + ionice/chrt + tuned chunk size.
+    # Use with ENHANCE_NVENC_GPUS=0,1 for dual-NVENC encoding.
+    "production": SchedulerProfile(
+        name="production",
+        cpuset_ffmpeg="0-7,16-23",
+        cpuset_audio="0-7,16-23",
+        cpuset_python="8-15,24-31",
+        ionice_class=2,
+        ionice_level=0,
+        use_chrt=True,
+        chunk_seconds=15,
     ),
 }
 

@@ -5,6 +5,8 @@ Key optimizations:
   - Dynamic task allocation across workers.
   - Reusable CPU batch buffers to avoid per-batch np.stack allocations.
   - Pinned CPU staging + split CUDA streams for H2D and compute telemetry.
+  - Async D2H with double-buffered pinned output buffers: overlaps GPU→CPU
+    transfer of batch N with compute of batch N+1 (see ESRGAN_D2H_DOUBLE_BUFFER).
 """
 import time, threading
 from pathlib import Path
@@ -135,13 +137,123 @@ class ESRGANEngine:
         net = self.models[worker_idx]
         dev = f"cuda:{dev_id}"
         bs = self.batches[worker_idx]
-        copy_stream = torch.cuda.Stream(device=dev_id) if C.ESRGAN_EXPERIMENTAL_PINNED_STAGING else None
-        compute_stream = torch.cuda.Stream(device=dev_id) if C.ESRGAN_EXPERIMENTAL_PINNED_STAGING else None
-        batch_buf = None
-        cpu_stage = None
+        use_pinned = C.ESRGAN_EXPERIMENTAL_PINNED_STAGING
+        use_double_buf = C.ESRGAN_D2H_DOUBLE_BUFFER
 
+        # -- CUDA streams ------------------------------------------------
+        copy_stream = torch.cuda.Stream(device=dev_id) if use_pinned else None
+        compute_stream = torch.cuda.Stream(device=dev_id) if use_pinned else None
+        d2h_stream = torch.cuda.Stream(device=dev_id)  # always: async D2H
+
+        # -- H2D pinned staging buffers (pinned path only) ----------------
+        batch_buf = None   # numpy (bs, H, W, 3) uint8
+        cpu_stage = None   # pinned torch (bs, 3, H, W) float16
+
+        # -- D2H output buffers (lazy-allocated on first inference) -------
+        d2h_bufs = [None, None]  # pinned torch (bs, out_h, out_w, 3) uint8
+        buf_idx = 0              # toggles 0/1 for double-buffering
+
+        # -- Double-buffer deferred-processing state ----------------------
+        prev = None  # dict with previous iteration's metadata
+
+        # -----------------------------------------------------------------
+        # Helper: consume a completed D2H buffer (visual post-proc + callbacks)
+        # -----------------------------------------------------------------
+        def _consume_output(buf_tensor, iter_start, iter_bs):
+            """Post-process and deliver frames from a completed D2H buffer.
+
+            Returns writer_wait_dt (seconds spent inside on_frame callback).
+            T2 optimisation: when no visual post-processing is needed, frames
+            are delivered as pinned-memory torch tensors (zero-copy buffer
+            protocol) instead of converting to numpy first.  The ReorderWriter
+            and pipe.write() both accept objects that implement the buffer
+            protocol, so the numpy round-trip is eliminated on the hot path.
+            When store is requested the tensor slice is copied once via
+            .numpy().copy().
+            """
+            needs_postproc = self._hybrid_weight > 0.0 or self._face_adaptive
+
+            if needs_postproc:
+                # Fall back to numpy for visual post-processing
+                out_np = buf_tensor[:iter_bs].numpy()
+                from .visual_eval import apply_hybrid_detail, apply_face_adaptive
+                for i in range(iter_bs):
+                    gidx = iter_start + i
+                    original = frames[gidx]
+                    if self._hybrid_weight > 0.0:
+                        out_np[i] = apply_hybrid_detail(
+                            out_np[i], original, self._hybrid_weight)
+                    if self._face_adaptive:
+                        out_np[i] = apply_face_adaptive(
+                            out_np[i], original, self._face_roi)
+
+                writer_wait_dt = 0.0
+                for i in range(iter_bs):
+                    gidx = iter_start + i
+                    if store is not None:
+                        store[gidx] = out_np[i].copy()
+                    if on_frame is not None:
+                        write_t0 = time.time()
+                        on_frame(gidx, out_np[i])
+                        writer_wait_dt += time.time() - write_t0
+                return writer_wait_dt
+
+            # T2: zero-copy path — pass pinned tensor slices directly
+            writer_wait_dt = 0.0
+            for i in range(iter_bs):
+                gidx = iter_start + i
+                frame_tensor = buf_tensor[i]
+                if store is not None:
+                    store[gidx] = frame_tensor.numpy().copy()
+                if on_frame is not None:
+                    write_t0 = time.time()
+                    on_frame(gidx, frame_tensor)
+                    writer_wait_dt += time.time() - write_t0
+            return writer_wait_dt
+
+        # -----------------------------------------------------------------
+        # Helper: flush deferred prev state (sync + consume + telemetry)
+        # -----------------------------------------------------------------
+        def _flush_prev():
+            nonlocal prev
+            if prev is None:
+                return
+            prev["d2h_event"].synchronize()
+            ww = _consume_output(prev["buf"], prev["start"], prev["cur_bs"])
+
+            # Resolve deferred d2h timing from CUDA events if not yet computed
+            d2h_dt_resolved = prev["d2h_dt"]
+            if d2h_dt_resolved == 0.0 and "d2h_ev0" in prev:
+                d2h_dt_resolved = prev["d2h_ev0"].elapsed_time(prev["d2h_ev1"]) / 1000.0
+
+            if telemetry is not None:
+                p = prev
+                with telemetry_lock:
+                    telemetry["fill"] = telemetry.get("fill", 0.0) + p["fill_dt"]
+                    telemetry["h2d"] = telemetry.get("h2d", 0.0) + p["h2d_dt"]
+                    telemetry["downscale"] = telemetry.get("downscale", 0.0) + p["downscale_dt"]
+                    telemetry["infer"] = telemetry.get("infer", 0.0) + p["infer_dt"]
+                    telemetry["d2h"] = telemetry.get("d2h", 0.0) + d2h_dt_resolved
+                    telemetry["writer_wait"] = telemetry.get("writer_wait", 0.0) + ww
+
+            with lock:
+                counter[0] += prev["cur_bs"]
+                c = counter[0]
+                if log_progress and (c % 50 < bs or c >= total):
+                    elapsed = time.time() - t0
+                    fps_now = c / elapsed if elapsed > 0 else 0
+                    eta = (total - c) / fps_now if fps_now > 0 else 0
+                    print(f"    ESRGAN {c}/{total}  "
+                          f"{fps_now:.1f}fps  ETA {eta:.0f}s",
+                          flush=True)
+            prev = None
+
+        # =================================================================
+        #  Main loop
+        # =================================================================
         while True:
             if C.shutdown.is_set():
+                _flush_prev()
                 return
 
             start, end = get_batch(bs)
@@ -149,7 +261,8 @@ class ESRGANEngine:
                 break
             cur_bs = end - start
 
-            if C.ESRGAN_EXPERIMENTAL_PINNED_STAGING:
+            # ----- Pinned-staging path (default) -------------------------
+            if use_pinned:
                 frame0 = frames[start]
                 if (
                     batch_buf is None
@@ -167,50 +280,132 @@ class ESRGANEngine:
                     batch_buf[i, ...] = frames[start + i]
                 fill_dt = time.time() - fill_t0
 
-                h2d_start = torch.cuda.Event(enable_timing=True)
-                h2d_end = torch.cuda.Event(enable_timing=True)
-                downscale_start = torch.cuda.Event(enable_timing=True)
-                downscale_end = torch.cuda.Event(enable_timing=True)
-                infer_start = torch.cuda.Event(enable_timing=True)
-                infer_end = torch.cuda.Event(enable_timing=True)
-                d2h_start = torch.cuda.Event(enable_timing=True)
-                d2h_end = torch.cuda.Event(enable_timing=True)
+                # Telemetry CUDA events
+                h2d_ev0 = torch.cuda.Event(enable_timing=True)
+                h2d_ev1 = torch.cuda.Event(enable_timing=True)
+                ds_ev0 = torch.cuda.Event(enable_timing=True)
+                ds_ev1 = torch.cuda.Event(enable_timing=True)
+                inf_ev0 = torch.cuda.Event(enable_timing=True)
+                inf_ev1 = torch.cuda.Event(enable_timing=True)
+                d2h_ev0 = torch.cuda.Event(enable_timing=True)
+                d2h_ev1 = torch.cuda.Event(enable_timing=True)
 
+                # H2D: pinned → GPU
                 cpu_batch = torch.from_numpy(batch_buf[:cur_bs]).permute(0, 3, 1, 2)
                 cpu_stage[:cur_bs].copy_(cpu_batch)
 
                 with torch.cuda.stream(copy_stream):
-                    h2d_start.record()
+                    h2d_ev0.record()
                     t_gpu = cpu_stage[:cur_bs].to(dev, non_blocking=True)
                     t_gpu = t_gpu.mul_(1.0 / 255.0)
-                    h2d_end.record()
+                    h2d_ev1.record()
 
+                # Compute: downscale + inference
                 with torch.cuda.stream(compute_stream):
                     compute_stream.wait_stream(copy_stream)
-                    downscale_start.record()
+                    ds_ev0.record()
                     if self._downscale_factor < 1.0:
                         t_small = torch.nn.functional.interpolate(
                             t_gpu, scale_factor=self._downscale_factor,
                             mode="bilinear", align_corners=False)
                     else:
                         t_small = t_gpu
-                    downscale_end.record()
+                    ds_ev1.record()
 
-                    infer_start.record()
+                    inf_ev0.record()
                     with torch.inference_mode():
                         out = net(t_small)
-                    infer_end.record()
+                    inf_ev1.record()
 
                     out_u8 = (out.clamp(0, 1) * 255).byte()
-                    d2h_start.record()
-                    out_cpu = out_u8.permute(0, 2, 3, 1).contiguous().cpu()
-                    d2h_end.record()
+                    # Permute to NHWC and make contiguous on GPU (fast)
+                    out_gpu_nhwc = out_u8.permute(0, 2, 3, 1).contiguous()
 
+                # Lazy-allocate D2H pinned output buffers on first inference
+                if d2h_bufs[0] is None:
+                    out_h, out_w = out_gpu_nhwc.shape[1], out_gpu_nhwc.shape[2]
+                    d2h_bufs[0] = torch.empty(
+                        (bs, out_h, out_w, 3), dtype=torch.uint8, pin_memory=True
+                    )
+                    if use_double_buf:
+                        d2h_bufs[1] = torch.empty(
+                            (bs, out_h, out_w, 3), dtype=torch.uint8, pin_memory=True
+                        )
+                    else:
+                        d2h_bufs[1] = d2h_bufs[0]  # alias: no real double-buffering
+
+                cur_d2h_buf = d2h_bufs[buf_idx]
+
+                # Async D2H copy on dedicated stream
+                compute_done = torch.cuda.Event()
+                compute_done.record(compute_stream)
+                with torch.cuda.stream(d2h_stream):
+                    d2h_stream.wait_event(compute_done)
+                    d2h_ev0.record()
+                    cur_d2h_buf[:cur_bs].copy_(out_gpu_nhwc, non_blocking=True)
+                    d2h_ev1.record()
+
+                d2h_done = torch.cuda.Event()
+                d2h_done.record(d2h_stream)
+
+                # ---- Process PREVIOUS iteration while D2H runs ----------
+                if use_double_buf:
+                    _flush_prev()
+                else:
+                    # Without double-buffering we must wait for THIS D2H
+                    _flush_prev()
+                    d2h_done.synchronize()
+
+                # Resolve telemetry for current iteration (need compute sync)
                 compute_stream.synchronize()
-                h2d_dt = h2d_start.elapsed_time(h2d_end) / 1000.0
-                downscale_dt = downscale_start.elapsed_time(downscale_end) / 1000.0
-                infer_dt = infer_start.elapsed_time(infer_end) / 1000.0
-                d2h_dt = d2h_start.elapsed_time(d2h_end) / 1000.0
+                h2d_dt = h2d_ev0.elapsed_time(h2d_ev1) / 1000.0
+                downscale_dt = ds_ev0.elapsed_time(ds_ev1) / 1000.0
+                infer_dt = inf_ev0.elapsed_time(inf_ev1) / 1000.0
+                # d2h timing resolved when prev is flushed next iteration
+                d2h_dt_val = d2h_ev0.elapsed_time(d2h_ev1) / 1000.0 if not use_double_buf else 0.0
+
+                if use_double_buf:
+                    # Defer output processing to next iteration
+                    prev = {
+                        "d2h_event": d2h_done,
+                        "buf": cur_d2h_buf,
+                        "start": start,
+                        "cur_bs": cur_bs,
+                        "fill_dt": fill_dt,
+                        "h2d_dt": h2d_dt,
+                        "downscale_dt": downscale_dt,
+                        "infer_dt": infer_dt,
+                        "d2h_dt": 0.0,  # placeholder, resolved at flush
+                        "d2h_ev0": d2h_ev0,
+                        "d2h_ev1": d2h_ev1,
+                    }
+                    buf_idx = 1 - buf_idx
+                else:
+                    # Already synced above; process immediately
+                    ww = _consume_output(cur_d2h_buf, start, cur_bs)
+                    if telemetry is not None:
+                        with telemetry_lock:
+                            telemetry["fill"] = telemetry.get("fill", 0.0) + fill_dt
+                            telemetry["h2d"] = telemetry.get("h2d", 0.0) + h2d_dt
+                            telemetry["downscale"] = telemetry.get("downscale", 0.0) + downscale_dt
+                            telemetry["infer"] = telemetry.get("infer", 0.0) + infer_dt
+                            telemetry["d2h"] = telemetry.get("d2h", 0.0) + d2h_dt_val
+                            telemetry["writer_wait"] = telemetry.get("writer_wait", 0.0) + ww
+                    with lock:
+                        counter[0] += cur_bs
+                        c = counter[0]
+                        if log_progress and (c % 50 < bs or c >= total):
+                            elapsed = time.time() - t0
+                            fps_now = c / elapsed if elapsed > 0 else 0
+                            eta = (total - c) / fps_now if fps_now > 0 else 0
+                            print(f"    ESRGAN {c}/{total}  "
+                                  f"{fps_now:.1f}fps  ETA {eta:.0f}s",
+                                  flush=True)
+
+                # Cleanup GPU tensors (pinned D2H buffers are reused)
+                del cpu_batch, t_gpu, t_small, out, out_u8, out_gpu_nhwc
+
+            # ----- Default (non-pinned) fallback path --------------------
             else:
                 fill_t0 = time.time()
                 batch_np = np.stack([frames[start + i] for i in range(cur_bs)])
@@ -241,59 +436,73 @@ class ESRGANEngine:
 
                 d2h_t0 = time.time()
                 out_u8 = (out.clamp(0, 1) * 255).byte()
-                out_cpu = out_u8.permute(0, 2, 3, 1).contiguous().cpu()
-                torch.cuda.synchronize(dev_id)
+                # Permute+contiguous on GPU, then async D2H to pinned buffer
+                out_gpu_nhwc = out_u8.permute(0, 2, 3, 1).contiguous()
+
+                # Lazy-allocate single pinned D2H buffer
+                if d2h_bufs[0] is None:
+                    out_h, out_w = out_gpu_nhwc.shape[1], out_gpu_nhwc.shape[2]
+                    d2h_bufs[0] = torch.empty(
+                        (bs, out_h, out_w, 3), dtype=torch.uint8, pin_memory=True
+                    )
+
+                with torch.cuda.stream(d2h_stream):
+                    d2h_bufs[0][:cur_bs].copy_(out_gpu_nhwc, non_blocking=True)
+                d2h_stream.synchronize()
                 d2h_dt = time.time() - d2h_t0
 
-            out_np = out_cpu.numpy()
+                out_np = d2h_bufs[0][:cur_bs].numpy()
 
-            # Apply visual post-processing from profile
-            if self._hybrid_weight > 0.0 or self._face_adaptive:
-                from .visual_eval import apply_hybrid_detail, apply_face_adaptive
+                # Apply visual post-processing from profile
+                if self._hybrid_weight > 0.0 or self._face_adaptive:
+                    from .visual_eval import apply_hybrid_detail, apply_face_adaptive
+                    for i in range(cur_bs):
+                        gidx = start + i
+                        original = frames[gidx]
+                        if self._hybrid_weight > 0.0:
+                            out_np[i] = apply_hybrid_detail(
+                                out_np[i], original, self._hybrid_weight)
+                        if self._face_adaptive:
+                            out_np[i] = apply_face_adaptive(
+                                out_np[i], original, self._face_roi)
+
+                writer_wait_dt = 0.0
                 for i in range(cur_bs):
                     gidx = start + i
-                    original = frames[gidx]
-                    if self._hybrid_weight > 0.0:
-                        out_np[i] = apply_hybrid_detail(
-                            out_np[i], original, self._hybrid_weight)
-                    if self._face_adaptive:
-                        out_np[i] = apply_face_adaptive(
-                            out_np[i], original, self._face_roi)
+                    if store is not None:
+                        store[gidx] = out_np[i].copy()
+                    if on_frame is not None:
+                        write_t0 = time.time()
+                        on_frame(gidx, out_np[i])
+                        writer_wait_dt += time.time() - write_t0
 
-            writer_wait_dt = 0.0
-            for i in range(cur_bs):
-                gidx = start + i
-                if store is not None:
-                    store[gidx] = out_np[i]
-                if on_frame is not None:
-                    write_t0 = time.time()
-                    on_frame(gidx, out_np[i])
-                    writer_wait_dt += time.time() - write_t0
+                if telemetry is not None:
+                    with telemetry_lock:
+                        telemetry["fill"] = telemetry.get("fill", 0.0) + fill_dt
+                        telemetry["h2d"] = telemetry.get("h2d", 0.0) + h2d_dt
+                        telemetry["downscale"] = telemetry.get("downscale", 0.0) + downscale_dt
+                        telemetry["infer"] = telemetry.get("infer", 0.0) + infer_dt
+                        telemetry["d2h"] = telemetry.get("d2h", 0.0) + d2h_dt
+                        telemetry["writer_wait"] = telemetry.get("writer_wait", 0.0) + writer_wait_dt
 
-            if telemetry is not None:
-                with telemetry_lock:
-                    telemetry["fill"] = telemetry.get("fill", 0.0) + fill_dt
-                    telemetry["h2d"] = telemetry.get("h2d", 0.0) + h2d_dt
-                    telemetry["downscale"] = telemetry.get("downscale", 0.0) + downscale_dt
-                    telemetry["infer"] = telemetry.get("infer", 0.0) + infer_dt
-                    telemetry["d2h"] = telemetry.get("d2h", 0.0) + d2h_dt
-                    telemetry["writer_wait"] = telemetry.get("writer_wait", 0.0) + writer_wait_dt
+                del batch_np, t_gpu, t_small, out, out_u8, out_gpu_nhwc
 
-            if C.ESRGAN_EXPERIMENTAL_PINNED_STAGING:
-                del cpu_batch, t_gpu, t_small, out, out_u8, out_cpu
-            else:
-                del batch_np, t_gpu, t_small, out, out_u8, out_cpu
+                with lock:
+                    counter[0] += cur_bs
+                    c = counter[0]
+                    if log_progress and (c % 50 < bs or c >= total):
+                        elapsed = time.time() - t0
+                        fps_now = c / elapsed if elapsed > 0 else 0
+                        eta = (total - c) / fps_now if fps_now > 0 else 0
+                        print(f"    ESRGAN {c}/{total}  "
+                              f"{fps_now:.1f}fps  ETA {eta:.0f}s",
+                              flush=True)
 
-            with lock:
-                counter[0] += cur_bs
-                c = counter[0]
-                if log_progress and (c % 50 < bs or c >= total):
-                    elapsed = time.time() - t0
-                    fps_now = c / elapsed if elapsed > 0 else 0
-                    eta = (total - c) / fps_now if fps_now > 0 else 0
-                    print(f"    ESRGAN {c}/{total}  "
-                          f"{fps_now:.1f}fps  ETA {eta:.0f}s",
-                          flush=True)
+        # =================================================================
+        #  Post-loop: flush last deferred double-buffer iteration
+        # =================================================================
+        if prev is not None:
+            _flush_prev()
 
 
     def _cpu_worker(self, frames: list[np.ndarray], get_batch: Callable,

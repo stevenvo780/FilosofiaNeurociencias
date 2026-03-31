@@ -9,6 +9,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from enhance import config as cfg
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -326,17 +328,26 @@ def apply_face_adaptive(
     if roi_crop.size == 0:
         return result
 
-    # Detect faces in the ROI
+    # Compute minimum face size from the ROI dimensions
+    roi_h, roi_w = roi_crop.shape[:2]
+    min_dim = int(max(roi_w, roi_h) * cfg.FACE_DETECT_MIN_SIZE_FRAC)
+    min_dim = max(min_dim, 10)  # absolute floor to avoid zero-size
+
+    # Detect faces in the ROI using configurable cascade parameters
     gray_roi = cv2.cvtColor(roi_crop, cv2.COLOR_BGR2GRAY)
     cascade = _get_face_cascade()
     faces = cascade.detectMultiScale(
         gray_roi,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(30, 30),
+        scaleFactor=cfg.FACE_DETECT_SCALE_FACTOR,
+        minNeighbors=cfg.FACE_DETECT_MIN_NEIGHBORS,
+        minSize=(min_dim, min_dim),
     )
 
-    if len(faces) == 0:
+    num_faces = len(faces) if isinstance(faces, np.ndarray) else 0
+    logger.debug("face_adaptive: detected %d face(s) in ROI %s (min_size=%d)",
+                 num_faces, roi, min_dim)
+
+    if num_faces == 0:
         return result
 
     for fx, fy, fw, fh in faces:

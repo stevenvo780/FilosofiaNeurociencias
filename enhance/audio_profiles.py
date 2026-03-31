@@ -68,7 +68,7 @@ def render_audio_ab(
         "output"}, …]}``
     """
     if profiles is None:
-        profiles = ["baseline", "conservative", "voice", "natural"]
+        profiles = ["baseline", "conservative", "voice", "natural", "voice_natural"]
     if thread_sweep is None:
         thread_sweep = [8, 16, 24]
 

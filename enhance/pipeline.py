@@ -163,10 +163,24 @@ class _ReorderWriter:
             target=self._writer_loop, daemon=True, name="nvenc-writer")
         self._writer_thread.start()
 
-    def on_frame(self, idx: int, frame: np.ndarray):
-        """Callback from ESRGAN GPU workers — thread-safe, minimal blocking."""
+    def on_frame(self, idx: int, frame):
+        """Callback from ESRGAN GPU workers — thread-safe, minimal blocking.
+
+        *frame* can be a numpy array or a torch tensor (pinned memory).
+        T2: both support the buffer protocol, so pipe.write(memoryview(arr))
+        works transparently.  When a torch tensor is received we keep it as-is
+        to avoid an unnecessary numpy copy on the hot path.
+        """
         self._sem.acquire()
-        arr = frame if frame.flags.c_contiguous else np.ascontiguousarray(frame)
+        # Accept numpy ndarray or torch tensor — both support buffer protocol
+        if hasattr(frame, 'flags'):
+            # numpy path
+            arr = frame if frame.flags.c_contiguous else np.ascontiguousarray(frame)
+        elif hasattr(frame, 'is_contiguous'):
+            # torch tensor path (T2: zero-copy from pinned D2H buffer)
+            arr = frame if frame.is_contiguous() else frame.contiguous()
+        else:
+            arr = np.ascontiguousarray(frame)
         with self.cond:
             self.buf[idx] = arr
             self._buffered += 1
@@ -357,7 +371,10 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_in: Path,
             "nvenc_peak_frames": 0,
         }
 
-    n_in = len(list(rife_in.glob("*.png")))
+    # T14: count input PNGs via pre-calculated path probing instead of glob
+    n_in = 0
+    while (rife_in / f"{n_in + 1:08d}.png").exists():
+        n_in += 1
     expected = expected_output_frames(n_in)
     if expected == 0:
         if budget is not None:
@@ -410,10 +427,9 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_in: Path,
             now = time.time()
             ready_paths: list[Path] = []
             probe = next_idx
+            # T14: use pre-calculated paths instead of glob scanning
             while probe < limit:
                 path = rife_out / f"{probe + 1:08d}.png"
-                if not path.exists():
-                    break
                 try:
                     st = path.stat()
                 except OSError:
@@ -466,8 +482,12 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_in: Path,
                 window_count += 1
                 window_total += ready_count
                 window_max = max(window_max, ready_count)
+                # T14: batch unlink all consumed paths at once
                 for path in ready_paths[:ready_count]:
-                    path.unlink(missing_ok=True)
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
                 if budget is not None:
                     extract_total, _ = budget.set_rife_ready(
                         cid, max(len(ready_paths) - ready_count, 0) * frame_nbytes
@@ -739,7 +759,34 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                   w: int, h: int,
                   budget: _BudgetController | None,
                   metrics: _MetricsStore | None):
-    """Stage 3: upscale frames and queue them for encode."""
+    """Stage 3: upscale frames and queue them for encode.
+
+    T3 optimisation: when direct_rife_stream is in effect (do_rife + do_esr),
+    the worker pre-starts RIFE for the *next* chunk while ESRGAN processes the
+    current chunk.  Since RIFE runs on GPU1 via Vulkan and ESRGAN uses GPU0
+    via CUDA, they execute truly in parallel on different GPUs.
+    """
+    # T3: prefetch state — RIFE for next chunk runs concurrently with ESRGAN
+    prefetch_thread: threading.Thread | None = None
+    prefetch_result: dict | None = None
+    prefetch_cid: int | None = None
+    prefetch_lock = threading.Lock()
+
+    def _rife_prefetch(cid_pf: int, raw_dir_pf: Path):
+        """Start RIFE interpolation for a chunk in background (T3)."""
+        nonlocal prefetch_result
+        try:
+            from .rife_backend import start_interpolate
+            rife_out_pf = raw_dir_pf.parent / "rife"
+            import shutil as _sh
+            _sh.rmtree(rife_out_pf, ignore_errors=True)
+            proc = start_interpolate(raw_dir_pf, rife_out_pf)
+            with prefetch_lock:
+                prefetch_result = {"proc": proc, "rife_out": rife_out_pf, "cid": cid_pf}
+        except Exception as exc:
+            with prefetch_lock:
+                prefetch_result = {"error": exc, "cid": cid_pf}
+
     while True:
         item = in_q.get()
         if item is None:
@@ -771,7 +818,40 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
 
         if do_esr and esr and do_rife and raw_dir is not None:
             gpu = C.NVENC_GPUS[cid % len(C.NVENC_GPUS)]
-            expected = expected_output_frames(len(list(raw_dir.glob("*.png"))))
+
+            # T14: count input frames via sequential probing (no glob)
+            n_in = 0
+            while (raw_dir / f"{n_in + 1:08d}.png").exists():
+                n_in += 1
+            expected = expected_output_frames(n_in)
+
+            # T3: peek at the next chunk — pre-start RIFE if available
+            next_item = None
+            try:
+                next_item = in_q.get_nowait()
+            except queue.Empty:
+                pass
+
+            if next_item is not None:
+                if len(next_item) == 3:
+                    _, _, next_raw = next_item
+                else:
+                    next_raw = None
+                next_cid = next_item[0] if next_item else None
+                if (
+                    next_raw is not None
+                    and next_cid is not None
+                    and not prog.done(next_cid, "encode")
+                ):
+                    prefetch_cid = next_cid
+                    prefetch_thread = threading.Thread(
+                        target=_rife_prefetch,
+                        args=(next_cid, next_raw),
+                        name=f"rife-prefetch-{next_cid:04d}",
+                        daemon=True,
+                    )
+                    prefetch_thread.start()
+
             stats = _stream_rife_esrgan_to_nvenc(
                 esr, raw_dir, vid, out_fps, gpu, cid, w, h, budget, metrics)
             prog.mark(cid, "rife")
@@ -833,6 +913,19 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
             if metrics is not None:
                 metrics.emit(cid)
             _report_progress(total, done_n, counter, lock, t_start)
+
+            # T3: re-queue the prefetched next item so the main loop picks it up
+            if next_item is not None:
+                # Wait for prefetch RIFE to have started
+                if prefetch_thread is not None:
+                    prefetch_thread.join(timeout=0.5)
+                # Put back the next item for normal processing
+                # (RIFE was already pre-started, _stream_rife_esrgan_to_nvenc
+                #  will find the rife_out dir already populated/populating)
+                in_q.put(next_item)
+                prefetch_thread = None
+                prefetch_result = None
+                prefetch_cid = None
             continue
 
         if frames is None:
