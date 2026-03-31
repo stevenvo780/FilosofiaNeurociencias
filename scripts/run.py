@@ -119,12 +119,13 @@ def main():
     s = start_at
     i = 0
     end_at = start_at + process_dur
-    while s < end_at:
+    min_chunk = 0.5 / max(fps, 1.0)
+    while s < end_at - 1e-6:
         cd = min(args.chunk, end_at - s)
-        if cd <= 0:
+        if cd <= 0 or cd < min_chunk:
             break
         chunks.append((i, s, cd))
-        s += args.chunk
+        s += cd
         i += 1
 
     n_chunks = len(chunks)

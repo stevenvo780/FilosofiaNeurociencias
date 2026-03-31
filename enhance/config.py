@@ -33,22 +33,34 @@ WRITE_WORKERS = int(os.getenv("ENHANCE_WRITE_WORKERS", "16"))
 EXTRACT_THREADS = int(os.getenv("ENHANCE_EXTRACT_THREADS", "4"))
 ENCODE_THREADS = int(os.getenv("ENHANCE_ENCODE_THREADS", "4"))
 
-ENABLE_TORCH_COMPILE = os.getenv("ENHANCE_TORCH_COMPILE", "1") == "1"
+ENABLE_TORCH_COMPILE = os.getenv("ENHANCE_TORCH_COMPILE", "0") == "1"
 TORCH_COMPILE_MODE = os.getenv("ENHANCE_TORCH_COMPILE_MODE", "reduce-overhead")
 TORCH_COMPILE_FULLGRAPH = os.getenv("ENHANCE_TORCH_COMPILE_FULLGRAPH", "0") == "1"
 TORCH_COMPILE_DISABLE_CUDAGRAPHS = (
     os.getenv("ENHANCE_TORCH_COMPILE_DISABLE_CUDAGRAPHS", "1") == "1"
 )
 
+TORCH_MATMUL_PRECISION = os.getenv("ENHANCE_TORCH_MATMUL_PRECISION", "highest")
+CUDNN_BENCHMARK = os.getenv("ENHANCE_CUDNN_BENCHMARK", "0") == "1"
+CUDA_MATMUL_ALLOW_TF32 = os.getenv("ENHANCE_CUDA_MATMUL_ALLOW_TF32", "0") == "1"
+CUDNN_ALLOW_TF32 = os.getenv("ENHANCE_CUDNN_ALLOW_TF32", "1") == "1"
+CUDNN_BENCHMARK_LIMIT = int(os.getenv("ENHANCE_CUDNN_BENCHMARK_LIMIT", "10"))
+
 ENABLE_NVDEC = os.getenv("ENHANCE_NVDEC", "0") == "1"
 NVENC_GPUS = tuple(
     int(token.strip())
-    for token in os.getenv("ENHANCE_NVENC_GPUS", "0,1").split(",")
+    for token in os.getenv("ENHANCE_NVENC_GPUS", "0").split(",")
+    if token.strip()
+)
+ESRGAN_GPUS = tuple(
+    int(token.strip())
+    for token in os.getenv("ENHANCE_ESRGAN_GPUS", "0").split(",")
     if token.strip()
 )
 RIFE_GPU = int(os.getenv("ENHANCE_RIFE_GPU", "1"))
-RIFE_THREADS = os.getenv("ENHANCE_RIFE_THREADS", "1:4:2")
+RIFE_THREADS = os.getenv("ENHANCE_RIFE_THREADS", "1:8:4")
 PIPELINE_DEPTH = max(int(os.getenv("ENHANCE_PIPELINE_DEPTH", "2")), 1)
+NVENC_STREAM_BUFFER = max(int(os.getenv("ENHANCE_NVENC_STREAM_BUFFER", "8")), 2)
 
 NVENC_PRESET = os.getenv("ENHANCE_NVENC_PRESET", "p1")
 NVENC_CQ = os.getenv("ENHANCE_NVENC_CQ", "19")

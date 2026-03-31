@@ -22,31 +22,35 @@ class ESRGANEngine:
         import spandrel
         self.torch = torch
 
-        torch.set_float32_matmul_precision("high")
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision(C.TORCH_MATMUL_PRECISION)
+        torch.backends.cudnn.benchmark = C.CUDNN_BENCHMARK
+        torch.backends.cuda.matmul.allow_tf32 = C.CUDA_MATMUL_ALLOW_TF32
+        torch.backends.cudnn.allow_tf32 = C.CUDNN_ALLOW_TF32
         if hasattr(torch.backends.cudnn, "benchmark_limit"):
-            torch.backends.cudnn.benchmark_limit = 0
+            torch.backends.cudnn.benchmark_limit = C.CUDNN_BENCHMARK_LIMIT
 
-        self.ngpu = min(torch.cuda.device_count(), 2)
+        visible_gpus = torch.cuda.device_count()
+        configured = [gid for gid in C.ESRGAN_GPUS if gid < visible_gpus]
+        self.gpu_ids = configured[:2] or list(range(min(visible_gpus, 2)))
+        self.ngpu = len(self.gpu_ids)
         self.models = []
-        self.batches = ([C.GPU0_BATCH, C.GPU1_BATCH]
-                        if self.ngpu > 1 else [C.GPU0_BATCH])
-        self.streams = []
+        self.batches = [
+            C.GPU0_BATCH if gid == 0 else C.GPU1_BATCH
+            for gid in self.gpu_ids
+        ]
 
-        for gid in range(self.ngpu):
+        for idx, gid in enumerate(self.gpu_ids):
             dev = f"cuda:{gid}"
             name = torch.cuda.get_device_name(gid)
-            bs = self.batches[gid]
+            bs = self.batches[idx]
             print(f"  [ESRGAN] GPU{gid} {name}  batch={bs}")
 
             m = spandrel.ModelLoader().load_from_file(C.ESRGAN_MODEL)
             self.scale = m.scale
+            self.output_scale = max(1, int(round(self.scale * 0.5)))
             net = m.model.half().to(dev).eval()
             net = self._maybe_compile(net, gid, bs, dev)
             self.models.append(net)
-            self.streams.append(torch.cuda.Stream(device=dev))
 
             dummy = torch.randn(bs, 3, 315, 560, device=dev, dtype=torch.float16)
             with torch.inference_mode():
@@ -101,124 +105,63 @@ class ESRGANEngine:
             print(f"    compile=off  reason={exc}", flush=True)
             return net
 
-    def _gpu_worker(self, gid: int, frames: list[np.ndarray], get_batch: Callable,
+    def _gpu_worker(self, worker_idx: int, dev_id: int,
+                    frames: list[np.ndarray], get_batch: Callable,
                     store: list | None, on_frame: Callable | None,
                     counter: list, lock: threading.Lock, total: int, t0: float):
         torch = self.torch
-        net = self.models[gid]
-        dev = f"cuda:{gid}"
-        bs = self.batches[gid]
-        stream = self.streams[gid]
+        net = self.models[worker_idx]
+        dev = f"cuda:{dev_id}"
+        bs = self.batches[worker_idx]
 
-        start, end = get_batch(bs)
-        if start is None:
-            return
-
-        sample_h, sample_w = frames[start].shape[:2]
-
-        pinned = [
-            torch.empty(bs, sample_h, sample_w, 3,
-                        dtype=torch.uint8, pin_memory=True),
-            torch.empty(bs, sample_h, sample_w, 3,
-                        dtype=torch.uint8, pin_memory=True),
-        ]
-
-        cur_bs = end - start
-        # Bulk copy: stack all frames at once, then single copy_ into pinned buffer
-        pinned[0][:cur_bs].copy_(torch.from_numpy(
-            np.stack([frames[start + i] for i in range(cur_bs)])))
-            
-        buf_idx = 0
-        prev_out_cpu = None
-        prev_start = 0
-        prev_bs = 0
-
-        while cur_bs > 0:
+        while True:
             if C.shutdown.is_set():
                 return
-            
-            cur_buf = buf_idx
-            next_start, next_end = get_batch(bs)
-            next_bs = next_end - next_start if next_start is not None else 0
-            next_buf = 1 - buf_idx
 
-            with torch.cuda.stream(stream):
-                t_gpu = (pinned[cur_buf][:cur_bs]
-                         .permute(0, 3, 1, 2)
-                         .to(dev, dtype=torch.float16,
-                             non_blocking=True) / 255.0)
+            start, end = get_batch(bs)
+            if start is None:
+                break
+            cur_bs = end - start
 
-                t_small = torch.nn.functional.interpolate(
-                    t_gpu, scale_factor=0.5,
-                    mode="bilinear", align_corners=False)
+            batch_np = np.stack([frames[start + i] for i in range(cur_bs)])
+            t_gpu = (
+                torch.from_numpy(batch_np)
+                .permute(0, 3, 1, 2)
+                .to(dev, dtype=torch.float16, non_blocking=True)
+                / 255.0
+            )
 
-                with torch.inference_mode():
-                    out = net(t_small)
+            t_small = torch.nn.functional.interpolate(
+                t_gpu, scale_factor=0.5,
+                mode="bilinear", align_corners=False)
 
-                out_u8 = (out.clamp(0, 1) * 255).byte()
-                # .contiguous() on GPU is ~5x faster than .copy() on CPU
-                out_cpu = out_u8.permute(0, 2, 3, 1).contiguous().cpu()
+            with torch.inference_mode():
+                out = net(t_small)
 
-            if prev_out_cpu is not None:
-                out_np = prev_out_cpu.numpy()
-                for i in range(prev_bs):
-                    gidx = prev_start + i
-                    if store is not None:
-                        store[gidx] = out_np[i]  # already contiguous from GPU
-                    if on_frame is not None:
-                        on_frame(gidx, out_np[i])
-                del prev_out_cpu
-                prev_out_cpu = None
+            out_u8 = (out.clamp(0, 1) * 255).byte()
+            out_cpu = out_u8.permute(0, 2, 3, 1).contiguous().cpu()
+            torch.cuda.synchronize(dev_id)
 
-                with lock:
-                    counter[0] += prev_bs
-                    c = counter[0]
-                    if c % 50 < bs or c >= total:
-                        elapsed = time.time() - t0
-                        fps_now = c / elapsed if elapsed > 0 else 0
-                        eta = (total - c) / fps_now if fps_now > 0 else 0
-                        print(f"    ESRGAN {c}/{total}  "
-                              f"{fps_now:.1f}fps  ETA {eta:.0f}s",
-                              flush=True)
-
-            # Bulk copy next batch while GPU works (overlapped via CUDA stream)
-            if next_bs > 0:
-                pinned[next_buf][:next_bs].copy_(torch.from_numpy(
-                    np.stack([frames[next_start + i] for i in range(next_bs)])))
-
-            torch.cuda.synchronize(gid)
-
-            prev_out_cpu = out_cpu
-            prev_start = start
-            prev_bs = cur_bs
-
-            del t_gpu, t_small, out, out_u8
-
-            buf_idx = next_buf
-            start = next_start
-            cur_bs = next_bs
-
-        if prev_out_cpu is not None:
-            out_np = prev_out_cpu.numpy()
-            for i in range(prev_bs):
-                gidx = prev_start + i
+            out_np = out_cpu.numpy()
+            for i in range(cur_bs):
+                gidx = start + i
                 if store is not None:
-                    store[gidx] = out_np[i].copy()
+                    store[gidx] = out_np[i]
                 if on_frame is not None:
                     on_frame(gidx, out_np[i])
-            del prev_out_cpu
+
+            del batch_np, t_gpu, t_small, out, out_u8, out_cpu
 
             with lock:
-                counter[0] += prev_bs
+                counter[0] += cur_bs
                 c = counter[0]
-                elapsed = time.time() - t0
-                fps_now = c / elapsed if elapsed > 0 else 0
-                eta = (total - c) / fps_now if fps_now > 0 else 0
-                print(f"    ESRGAN {c}/{total}  "
-                      f"{fps_now:.1f}fps  ETA {eta:.0f}s",
-                      flush=True)
-
-        del pinned
+                if c % 50 < bs or c >= total:
+                    elapsed = time.time() - t0
+                    fps_now = c / elapsed if elapsed > 0 else 0
+                    eta = (total - c) / fps_now if fps_now > 0 else 0
+                    print(f"    ESRGAN {c}/{total}  "
+                          f"{fps_now:.1f}fps  ETA {eta:.0f}s",
+                          flush=True)
 
 
     def _cpu_worker(self, frames: list[np.ndarray], get_batch: Callable,
@@ -304,11 +247,35 @@ class ESRGANEngine:
             threads.append(thread)
 
         # Deploy fetching worker for GPU0 (Fastest: Pulls 8 frames automatically)
-        launch(self._gpu_worker, 0, frames, get_batch, store, on_frame, counter, lock, total, t0)
+        launch(
+            self._gpu_worker,
+            0,
+            self.gpu_ids[0],
+            frames,
+            get_batch,
+            store,
+            on_frame,
+            counter,
+            lock,
+            total,
+            t0,
+        )
         
         # Deploy fetching worker for GPU1 (Slightly Slower: Pulls 4 frames automatically)
         if self.ngpu > 1:
-            launch(self._gpu_worker, 1, frames, get_batch, store, on_frame, counter, lock, total, t0)
+            launch(
+                self._gpu_worker,
+                1,
+                self.gpu_ids[1],
+                frames,
+                get_batch,
+                store,
+                on_frame,
+                counter,
+                lock,
+                total,
+                t0,
+            )
             
         # Deploy fetching worker for CPU (R9 Processor: Pulls 1 frame slowly behind them)
         if self.cpu_enabled:

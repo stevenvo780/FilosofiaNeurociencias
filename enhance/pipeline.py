@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import threading
 import time
+import traceback
+from contextlib import suppress
 from pathlib import Path
 
 import cv2
@@ -39,7 +41,7 @@ class _ReorderWriter:
     ESRGAN), on_frame blocks until the writer thread drains, providing
     natural backpressure to GPU workers without OOM risk.
     """
-    MAX_BUFFERED = 48  
+    MAX_BUFFERED = C.NVENC_STREAM_BUFFER
 
     __slots__ = ("pipe", "lock", "cond", "buf", "next_idx", "total",
                  "written", "_finished", "_writer_thread", "_error", "_sem")
@@ -106,12 +108,14 @@ class _ReorderWriter:
             self._finished = True
             self.cond.notify()
         self._writer_thread.join(timeout=120)
-        if self._error:
-            print(f"    [!] ReorderWriter error: {self._error}", flush=True)
         with self.lock:
-            if self.buf:
-                print(f"    [!] ReorderWriter: {len(self.buf)} orphan frames "
-                      f"(missing indices before them)", flush=True)
+            orphaned = len(self.buf)
+        if self._error:
+            raise RuntimeError(f"ReorderWriter error: {self._error}") from self._error
+        if orphaned:
+            raise RuntimeError(
+                f"ReorderWriter left {orphaned} orphan frames waiting for missing indices"
+            )
 
 
 def _open_nvenc_pipe(out_file: Path, w: int, h: int, fps: float,
@@ -162,6 +166,41 @@ def _encode_from_numpy(frames: list[np.ndarray], out_file: Path,
     proc.wait()
     if proc.returncode != 0:
         raise RuntimeError(f"NVENC encode failed (rc={proc.returncode})")
+
+
+def _stream_esrgan_to_nvenc(esr: ESRGANEngine, frames: list[np.ndarray],
+                            out_file: Path, fps: float, gpu: int) -> tuple[int, float]:
+    """Upscale and encode a chunk without materializing 4K frames in RAM."""
+    if out_file.exists() and out_file.stat().st_size > 1000:
+        return 0, 0.0
+    if not frames:
+        return 0, 0.0
+
+    h, w = frames[0].shape[:2]
+    proc = _open_nvenc_pipe(out_file, w * esr.output_scale, h * esr.output_scale, fps, gpu)
+    writer = _ReorderWriter(proc.stdin, len(frames))
+    t0 = time.time()
+
+    try:
+        produced = esr.process_streaming(frames, writer.on_frame)
+        writer.flush_remaining()
+
+        with suppress(BrokenPipeError, OSError, ValueError):
+            proc.stdin.close()
+        proc.wait()
+    except Exception:
+        with suppress(Exception):
+            writer.flush_remaining()
+        with suppress(Exception):
+            proc.kill()
+        with suppress(Exception):
+            proc.wait(timeout=5)
+        raise
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"NVENC streaming encode failed (rc={proc.returncode})")
+
+    return produced, time.time() - t0
 
 
 def _write_pngs(frames: list[np.ndarray], out_dir: Path):
@@ -216,7 +255,8 @@ def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
             out_q.put(None)
             break
         if C.shutdown.is_set():
-            continue
+            out_q.put(None)
+            break
             
         cid, frames = item
         if frames is None or prog.done(cid, "encode"):
@@ -230,12 +270,20 @@ def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
 
         rife_in = _tmpfs_chunk(cid) / "raw"
         rife_out = _tmpfs_chunk(cid) / "rife"
+        frame_count = len(frames)
 
         # RIFE intermediates live on tmpfs, so this stage must rerun unless
         # the chunk is already encoded.
+        tw = time.time()
         _write_pngs(frames, rife_in)
+        dt_write = time.time() - tw
         del frames
         gc.collect()
+        print(
+            f"  | RIFE input write: {frame_count} frames "
+            f"({dt_write:.1f}s, {frame_count/dt_write:.1f}fps) chunk {cid:04d}",
+            flush=True,
+        )
         
         tr = time.time()
         n = rife_interpolate(rife_in, rife_out)
@@ -252,9 +300,17 @@ def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
             img = cv2.imread(str(p), cv2.IMREAD_COLOR)
             return cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else None
         
+        tread = time.time()
         with ThreadPoolExecutor(max_workers=C.READ_WORKERS) as pool:
             interp_frames = list(pool.map(_read_png, png_files))
+        dt_read = time.time() - tread
         interp_frames = [f for f in interp_frames if f is not None]
+        if interp_frames:
+            print(
+                f"  | RIFE readback: {len(interp_frames)} frames "
+                f"({dt_read:.1f}s, {len(interp_frames)/dt_read:.1f}fps) chunk {cid:04d}",
+                flush=True,
+            )
         
         # Cleanup RIFE tmpfs
         shutil.rmtree(_tmpfs_chunk(cid), ignore_errors=True)
@@ -275,7 +331,9 @@ def _report_progress(total: int, done_n: int, counter: list[int],
 
 def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                   fps: float, work: Path, prog: Progress,
-                  in_q: queue.Queue, out_q: queue.Queue):
+                  in_q: queue.Queue, out_q: queue.Queue,
+                  total: int, done_n: int, t_start: float,
+                  counter: list[int], lock: threading.Lock):
     """Stage 3: upscale frames and queue them for encode."""
     while True:
         item = in_q.get()
@@ -284,7 +342,9 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                 out_q.put(None)
             break
         if C.shutdown.is_set():
-            continue
+            for _ in C.NVENC_GPUS:
+                out_q.put(None)
+            break
 
         cid, frames = item
         if frames is None or prog.done(cid, "encode"):
@@ -300,12 +360,24 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
         n = len(frames)
 
         if do_esr and esr:
-            t0 = time.time()
-            enc_frames = esr.process_frames(frames, out_dir=None)
-            dt_esr = time.time() - t0
+            gpu = C.NVENC_GPUS[cid % len(C.NVENC_GPUS)]
+            produced, dt_esr = _stream_esrgan_to_nvenc(esr, frames, vid, out_fps, gpu)
             prog.mark(cid, "esrgan")
-            print(f"  [ESRGAN] chunk {cid:04d}: {n} frames ({dt_esr:.1f}s, {n/dt_esr:.1f}fps)", flush=True)
             del frames
+            gc.collect()
+            if produced != n:
+                raise RuntimeError(
+                    f"Streaming ESRGAN/NVENC produced {produced} frames, expected {n}"
+                )
+            prog.mark(cid, "encode")
+            prog.mark(cid, "clean")
+            print(
+                f"  [ESRGAN→NVENC@GPU{gpu}] chunk {cid:04d}: "
+                f"{n} frames ({dt_esr:.1f}s, {n/dt_esr:.1f}fps)",
+                flush=True,
+            )
+            _report_progress(total, done_n, counter, lock, t_start)
+            continue
         else:
             enc_frames = frames
 
@@ -323,7 +395,7 @@ def encode_worker(worker_idx: int, gpu: int, prog: Progress,
         if item is None:
             break
         if C.shutdown.is_set():
-            continue
+            break
 
         cid, frames, vid, out_fps = item
         if not frames:
@@ -392,13 +464,31 @@ def run(chunks, src: Path, work: Path, prog: Progress,
             try:
                 target(*args)
             except BaseException as exc:
+                print(f"  [!] {name} failed: {exc}", flush=True)
+                traceback.print_exc()
                 errors.append(exc)
                 C.shutdown.set()
         return threading.Thread(target=runner, name=name)
 
     t_ext = spawn("Extractor Thread", extract_worker, pending, src, w, h, do_esr, prog, q_extract)
     t_rife = spawn("RIFE Interpolator (1260p)", rife_first_worker, do_rife, fps, prog, q_extract, q_rife)
-    t_esr = spawn("ESRGAN Upscaler", esrgan_worker, esr, do_esr, do_rife, fps, work, prog, q_rife, q_encode)
+    t_esr = spawn(
+        "ESRGAN Upscaler",
+        esrgan_worker,
+        esr,
+        do_esr,
+        do_rife,
+        fps,
+        work,
+        prog,
+        q_rife,
+        q_encode,
+        total,
+        done_n,
+        t_start,
+        encode_counter,
+        encode_lock,
+    )
     encode_threads = [
         spawn(
             f"NVENC Worker {idx}",
@@ -415,11 +505,20 @@ def run(chunks, src: Path, work: Path, prog: Progress,
     for thread in encode_threads:
         thread.start()
 
-    t_ext.join()
-    t_rife.join()
-    t_esr.join()
-    for thread in encode_threads:
-        thread.join()
+    all_threads = [t_ext, t_rife, t_esr, *encode_threads]
+    sentinels_pushed = False
+    while any(thread.is_alive() for thread in all_threads):
+        if errors and not sentinels_pushed:
+            sentinels_pushed = True
+            with suppress(queue.Full):
+                q_extract.put_nowait(None)
+            with suppress(queue.Full):
+                q_rife.put_nowait(None)
+            for _ in encode_threads:
+                with suppress(queue.Full):
+                    q_encode.put_nowait(None)
+        for thread in all_threads:
+            thread.join(timeout=0.2)
 
     if errors:
         raise RuntimeError(f"Pipeline worker failed: {errors[0]}") from errors[0]
