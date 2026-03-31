@@ -195,6 +195,15 @@ def build_run_cmd(args) -> list[str]:
     ]
     if args.outdir:
         cmd += ["--outdir", args.outdir]
+    # Forward profile arguments to run.py
+    cmd += [
+        "--visual-profile", args.visual_profile,
+        "--audio-profile", args.audio_profile,
+        "--scheduler-profile", args.scheduler_profile,
+        "--rife-backend", args.rife_backend,
+    ]
+    if args.models_dir:
+        cmd += ["--models-dir", args.models_dir]
     return cmd
 
 

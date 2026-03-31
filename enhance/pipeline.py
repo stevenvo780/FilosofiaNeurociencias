@@ -963,6 +963,11 @@ def run(chunks, src: Path, work: Path, prog: Progress,
     if rife_backend_profile:
         profile_tags["rife_backend"] = rife_backend_profile.name
 
+    # Inject profile tags into metrics for every pending chunk
+    for cid, _, _ in pending:
+        if profile_tags:
+            metrics.update(cid, **profile_tags)
+
     q_extract = queue.Queue(maxsize=C.PIPELINE_DEPTH)
     q_rife = queue.Queue(maxsize=C.PIPELINE_DEPTH)
     q_encode = queue.Queue(maxsize=max(C.PIPELINE_DEPTH, 1))

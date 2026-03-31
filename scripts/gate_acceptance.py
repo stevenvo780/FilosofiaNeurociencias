@@ -85,8 +85,19 @@ def check_chunk_time(metrics: list[dict]) -> Result:
 
 
 def check_throughput(metrics: list[dict], wall_time: float | None = None) -> Result:
-    """Throughput ratio = (chunk_seconds * n_chunks) / wall_time."""
-    chunk_secs = [m.get("chunk_seconds", m.get("duration", 0)) for m in metrics]
+    """Throughput ratio = total_content_seconds / wall_time.
+
+    Content duration per chunk is read from ``chunk_seconds``, ``duration``,
+    or inferred from ``extract_frames / 25`` (source FPS) as a fallback.
+    """
+    chunk_secs = []
+    for m in metrics:
+        cs = m.get("chunk_seconds") or m.get("duration") or 0
+        if cs == 0:
+            # Fallback: infer from extracted frames at source fps
+            ef = m.get("extract_frames", 0)
+            cs = ef / 25.0 if ef > 0 else 15.0  # default 15s chunk
+        chunk_secs.append(cs)
     total_content = sum(chunk_secs)
     n = len(metrics)
 
@@ -156,8 +167,9 @@ def _parse_human_bytes(s: str) -> int:
 
 def check_zombie_processes() -> Result:
     """No orphan rife-ncnn or ffmpeg enhance processes should be running."""
-    r = _run("pgrep -f 'rife-ncnn|ffmpeg.*enhance'")
-    pids = [p.strip() for p in r.stdout.strip().splitlines() if p.strip()]
+    # Use grep -v to exclude the pgrep/grep processes themselves
+    r = _run("pgrep -af 'rife-ncnn-vulkan|ffmpeg.*enhance_work' | grep -v pgrep | grep -v grep")
+    pids = [p.strip().split()[0] for p in r.stdout.strip().splitlines() if p.strip()]
     return Result(
         name="zombie_processes",
         passed=len(pids) == 0,

@@ -176,7 +176,9 @@ def main():
             esr = ESRGANEngine(visual_profile=vp)
         run_pipeline(
             chunks, src, work, prog, do_esr, do_rife, fps, esr,
-            w=w, h=h)
+            w=w, h=h,
+            visual_profile=vp, audio_profile=aup,
+            scheduler_profile=sp, rife_backend_profile=rp)
         wall = time.time() - t_go
         if wall > 0:
             print(f"\n  Processing: {wall/3600:.1f}h  "
