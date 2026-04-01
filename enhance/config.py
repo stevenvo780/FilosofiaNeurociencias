@@ -78,6 +78,11 @@ RIFE_STREAM_WINDOW = max(int(os.getenv("ENHANCE_RIFE_STREAM_WINDOW", "192")), 16
 RIFE_MIN_WINDOW = max(int(os.getenv("ENHANCE_RIFE_MIN_WINDOW", "64")), 1)
 RIFE_POLL_SECONDS = float(os.getenv("ENHANCE_RIFE_POLL_SECONDS", "0.05"))
 RIFE_FILE_SETTLE_SECONDS = float(os.getenv("ENHANCE_RIFE_FILE_SETTLE_SECONDS", "0.05"))
+RIFE_TORCH_MODEL_NAME = os.getenv("ENHANCE_RIFE_TORCH_MODEL_NAME", "paper_v6")
+RIFE_TORCH_MODEL_FILE = os.getenv("ENHANCE_RIFE_TORCH_MODEL_FILE", "")
+RIFE_TORCH_MODEL_DIR = os.getenv("ENHANCE_RIFE_TORCH_MODEL_DIR", "")
+RIFE_TORCH_THREADS = max(int(os.getenv("ENHANCE_RIFE_TORCH_THREADS", "0")), 0)
+RIFE_ALLOW_BLEND_FALLBACK = os.getenv("ENHANCE_RIFE_ALLOW_BLEND_FALLBACK", "0") == "1"
 # Allow ESRGAN CUDA work to share the same physical GPU as RIFE Vulkan during
 # direct streaming. This can improve occupancy, but on the RTX 2060 it may run
 # out of VRAM with real_x2plus quality profiles.

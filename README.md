@@ -180,6 +180,11 @@ Toda la configuración se controla via variables de entorno en `enhance/config.p
 | `ENHANCE_RIFE_THREADS` | `1:8:4` | Threads RIFE (j:p:t) |
 | `ENHANCE_RIFE_STREAM_WINDOW` | `192` | Ventana de streaming RIFE→ESRGAN |
 | `ENHANCE_RIFE_MIN_WINDOW` | `64` | Mínimo de frames por ventana |
+| `ENHANCE_RIFE_TORCH_MODEL_NAME` | `paper_v6` | Modelo oficial IFNet para backend torch |
+| `ENHANCE_RIFE_TORCH_MODEL_FILE` | `""` | Ruta directa a `flownet.pkl` para backend torch |
+| `ENHANCE_RIFE_TORCH_MODEL_DIR` | `""` | Directorio que contiene `flownet.pkl` para backend torch |
+| `ENHANCE_RIFE_TORCH_THREADS` | `0` | Hilos CPU para backend torch (`0` = default de PyTorch) |
+| `ENHANCE_RIFE_ALLOW_BLEND_FALLBACK` | `0` | Solo para depuración si falla la carga del modelo torch |
 | `ENHANCE_PIPELINE_DEPTH` | `2` | Profundidad del pipeline de chunks |
 | `ENHANCE_MAX_EXTRACT_BYTES_IN_FLIGHT` | `6 GiB` | Budget de extracción en vuelo |
 | `ENHANCE_MAX_RIFE_READY_BYTES` | `3 GiB` | Budget de frames RIFE listos |
@@ -194,7 +199,7 @@ Toda la configuración se controla via variables de entorno en `enhance/config.p
 | `ENHANCE_VISUAL_PROFILE` | `None` | Perfil visual (baseline, quality, etc.) |
 | `ENHANCE_AUDIO_PROFILE` | `None` | Perfil de audio |
 | `ENHANCE_SCHEDULER_PROFILE` | `None` | Perfil de scheduler CPU |
-| `ENHANCE_RIFE_BACKEND` | `None` | Backend RIFE (ncnn, torch) |
+| `ENHANCE_RIFE_BACKEND` | `None` | Backend RIFE (`baseline` usa ncnn; `torch/torch_cpu` usa IFNet oficial) |
 
 ### Variables PyTorch
 

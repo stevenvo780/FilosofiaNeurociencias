@@ -502,8 +502,8 @@ def test_rife_backend_creation():
     backend = create_backend(RIFEBackendProfile(name="test", backend="ncnn"))
     assert isinstance(backend, NCNNBackend)
     
-    # T15: Torch — should create and be functional (no longer stub)
-    backend = create_backend(RIFEBackendProfile(name="test", backend="torch"))
+    # T15: Torch CPU — should load the official IFNet checkpoint and interpolate
+    backend = create_backend(RIFEBackendProfile(name="test", backend="torch", device="cpu", model_name="paper_v6"))
     assert isinstance(backend, TorchBackend)
     assert backend.name() == "torch"
     assert backend.expected_output_frames(10) == 20
@@ -520,7 +520,13 @@ def test_rife_backend_creation():
             img[:, :, 0] = i * 80
             cv2.imwrite(str(in_dir / f"{i+1:08d}.png"), img)
         n = backend.interpolate_sync(in_dir, out_dir)
-        assert n >= 5, f"Expected >= 5 output frames from 3 inputs, got {n}"
+        assert n == 6, f"Expected 6 output frames from 3 inputs, got {n}"
+        mid = cv2.imread(str(out_dir / "00000002.png"), cv2.IMREAD_COLOR)
+        f0 = cv2.imread(str(in_dir / "00000001.png"), cv2.IMREAD_COLOR)
+        f1 = cv2.imread(str(in_dir / "00000002.png"), cv2.IMREAD_COLOR)
+        blend = ((f0.astype(np.uint16) + f1.astype(np.uint16) + 1) // 2).astype(np.uint8)
+        diff = np.abs(mid.astype(np.int16) - blend.astype(np.int16)).mean()
+        assert diff > 0.1, f"Expected real IFNet output, got blend-like diff={diff}"
     
     print("  [OK] RIFE backend factory works correctly")
     return True

@@ -50,7 +50,7 @@ def main():
     ap.add_argument("--scheduler-profile", type=str, default=None,
                     help="CPU scheduler profile (baseline, split_l3_a, split_l3_b, production)")
     ap.add_argument("--rife-backend", type=str, default=None,
-                    help="RIFE backend (baseline, torch, torch_cpu)")
+                    help="RIFE backend (baseline, torch, torch_cpu). torch* usa IFNet oficial y descarga flownet.pkl si hace falta")
     ap.add_argument("--rife-threads", type=str, default=None,
                     help="Override RIFE thread tuple load:proc:save (e.g. 1:8:4)")
     ap.add_argument("--models-dir", type=str, default=None,

@@ -254,7 +254,7 @@ def parse_args():
     ap.add_argument("--scheduler-profile", type=str, default="baseline",
                     help="Scheduler profile")
     ap.add_argument("--rife-backend", type=str, default="baseline",
-                    help="RIFE interpolation backend")
+                    help="RIFE interpolation backend. torch/torch_cpu usan IFNet oficial y descargan flownet.pkl si hace falta")
     ap.add_argument("--quality-only", action="store_true",
                     help="Only run quality evaluation, skip throughput")
     ap.add_argument("--throughput-only", action="store_true",

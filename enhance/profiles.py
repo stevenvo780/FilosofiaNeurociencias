@@ -64,6 +64,7 @@ class RIFEBackendProfile:
     name: str = "baseline"
     backend: str = "ncnn"
     device: str = "cuda"
+    model_name: str = "paper_v6"
     gpu: int = 1
     stream_window: int = 192
     min_window: int = 64
@@ -274,11 +275,13 @@ RIFE_BACKEND_PROFILES: Dict[str, RIFEBackendProfile] = {
     "torch": RIFEBackendProfile(
         name="torch",
         backend="torch",
+        model_name="paper_v6",
     ),
     "torch_cpu": RIFEBackendProfile(
         name="torch_cpu",
         backend="torch",
         device="cpu",
+        model_name="paper_v6",
     ),
 }
 

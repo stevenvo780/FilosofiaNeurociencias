@@ -1,7 +1,7 @@
 """Abstract RIFE backend with ncnn and torch implementations.
 
 Provides a pluggable backend interface so the pipeline can switch between
-the proven ncnn-Vulkan binary and a future pure-torch implementation
+the proven ncnn-Vulkan binary and the official IFNet torch implementation
 without touching the rest of the codebase.
 """
 from __future__ import annotations
@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from . import config as C
+from .rife_torch_model import OfficialRIFEInterpolator, ensure_torch_rife_checkpoint
 
 if TYPE_CHECKING:
     from .profiles import RIFEBackendProfile
@@ -177,24 +178,25 @@ class NCNNBackend(RIFEBackend):
 # ── Torch backend (stub — future pure-Python RIFE) ──────────────────────────
 
 class TorchBackend(RIFEBackend):
-    """Pure-torch RIFE backend — frame interpolation via IFNet in GPU memory.
+    """Official IFNet-based torch backend for CPU/GPU RIFE inference."""
 
-    T15: Eliminates PNG I/O by keeping frames in RAM/GPU.  Uses the IFNet
-    architecture (RIFE v4.x) loaded from a local checkpoint or downloaded
-    from the official ECCV2022-RIFE repository.
-
-    When used from the streaming pipeline the workflow is:
-      1. ``start_interpolate()`` reads input PNGs, interpolates in-memory,
-         and writes results as PNGs for downstream compatibility.
-      2. A future ``interpolate_tensors()`` method will skip PNG I/O entirely.
-    """
-
-    def __init__(self, gpu: int = 0, model_name: str = "rife46", device: str | None = None) -> None:
+    def __init__(
+        self,
+        gpu: int = 0,
+        model_name: str = "paper_v6",
+        device: str | None = None,
+        model_file: str | None = None,
+        model_dir: str | None = None,
+        cpu_threads: int = 0,
+    ) -> None:
         self._gpu = gpu
         self._model_name = model_name
         self._model: Any = None
         requested = (device or f"cuda:{gpu}").strip().lower()
         self._device: str = "cpu" if requested == "cpu" else f"cuda:{gpu}"
+        self._model_file = model_file
+        self._model_dir = model_dir
+        self._cpu_threads = cpu_threads
 
         # Timing metrics
         self._spawn_t: float = 0.0
@@ -204,36 +206,25 @@ class TorchBackend(RIFEBackend):
         self._running_t0: float | None = None
 
     def _ensure_model(self) -> None:
-        """Load IFNet weights for in-memory interpolation.
-
-        Tries to load from a local checkpoint first; falls back to a
-        minimal IFNet stub that does simple frame averaging when the real
-        weights are not available.
-        """
+        """Load real IFNet weights, with opt-in blend fallback for experiments."""
         if self._model is not None:
             return
 
-        import torch
-
-        # Try loading from a local checkpoint first. The current wrapper still
-        # falls back to blend-only interpolation when the full IFNet graph is
-        # unavailable, so this backend remains experimental.
-        model_dir = Path(C.TMPFS_WORK).parent / "rife_torch_models"
-        model_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint = model_dir / f"{self._model_name}.pth"
-
-        if checkpoint.exists():
-            try:
-                state = torch.load(checkpoint, map_location=self._device, weights_only=True)
-                # Wrap in a simple callable
-                self._model = _IFNetWrapper(state, self._device)
-                return
-            except Exception:
-                pass
-
-        # Fallback: simple frame-blending interpolator (no real IFNet weights)
-        # This provides correct frame count and acceptable quality for testing
-        self._model = _BlendInterpolator(self._device)
+        try:
+            checkpoint = ensure_torch_rife_checkpoint(
+                model_name=self._model_name,
+                model_file=self._model_file or C.RIFE_TORCH_MODEL_FILE or None,
+                model_dir=self._model_dir or C.RIFE_TORCH_MODEL_DIR or None,
+            )
+            self._model = OfficialRIFEInterpolator(
+                checkpoint=checkpoint,
+                device=self._device,
+                cpu_threads=self._cpu_threads or C.RIFE_TORCH_THREADS,
+            )
+        except Exception:
+            if not C.RIFE_ALLOW_BLEND_FALLBACK:
+                raise
+            self._model = _BlendInterpolator(self._device)
 
     # -- ABC implementation ------------------------------------------------
 
@@ -274,55 +265,57 @@ class TorchBackend(RIFEBackend):
         out_dir.mkdir(parents=True, exist_ok=True)
         t0 = time.monotonic()
 
-        # Collect sorted input frames
         png_paths = sorted(in_dir.glob("*.png"))
         if not png_paths:
             handle._returncode = 0
             return
 
-        # Read all input frames
-        frames = []
-        for p in png_paths:
-            img = cv2.imread(str(p), cv2.IMREAD_COLOR)
-            if img is not None:
-                frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        def _read_rgb(path: Path):
+            img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else None
 
-        if len(frames) < 2:
-            # Write single frame twice
-            for i, f in enumerate(frames):
+        prev = _read_rgb(png_paths[0])
+        if prev is None:
+            handle._returncode = 1
+            return
+
+        if len(png_paths) == 1:
+            for i in range(2):
                 dst = out_dir / f"{i + 1:08d}.png"
-                cv2.imwrite(str(dst), cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+                cv2.imwrite(str(dst), cv2.cvtColor(prev, cv2.COLOR_RGB2BGR))
             handle._returncode = 0
             return
 
         self._spawn_t = time.monotonic() - t0
         t1 = time.monotonic()
 
-        # Interpolate: for each pair (f_i, f_{i+1}), produce f_i and mid-frame
         out_idx = 1
         with torch.inference_mode():
-            for i in range(len(frames) - 1):
+            for path in png_paths[1:]:
                 if C.shutdown.is_set():
                     handle._returncode = -1
                     return
 
-                f0 = frames[i]
-                f1 = frames[i + 1]
+                curr = _read_rgb(path)
+                if curr is None:
+                    handle._returncode = 1
+                    return
 
-                # Write original frame
                 dst = out_dir / f"{out_idx:08d}.png"
-                cv2.imwrite(str(dst), cv2.cvtColor(f0, cv2.COLOR_RGB2BGR))
+                cv2.imwrite(str(dst), cv2.cvtColor(prev, cv2.COLOR_RGB2BGR))
                 out_idx += 1
 
-                # Generate interpolated mid-frame
-                mid = self._model.interpolate(f0, f1)
+                mid = self._model.interpolate(prev, curr)
                 dst = out_dir / f"{out_idx:08d}.png"
                 cv2.imwrite(str(dst), cv2.cvtColor(mid, cv2.COLOR_RGB2BGR))
                 out_idx += 1
+                prev = curr
 
-            # Write last frame
-            dst = out_dir / f"{out_idx:08d}.png"
-            cv2.imwrite(str(dst), cv2.cvtColor(frames[-1], cv2.COLOR_RGB2BGR))
+            # Match ncnn's exact 2x frame count by duplicating the final frame.
+            for _ in range(2):
+                dst = out_dir / f"{out_idx:08d}.png"
+                cv2.imwrite(str(dst), cv2.cvtColor(prev, cv2.COLOR_RGB2BGR))
+                out_idx += 1
 
         self._compute_t = time.monotonic() - t1
         handle._returncode = 0
@@ -389,11 +382,10 @@ class _TorchHandle:
 
 
 class _BlendInterpolator:
-    """Simple frame-blending fallback when IFNet weights are unavailable.
+    """Debug-only frame blending fallback.
 
-    Produces acceptable motion interpolation by alpha-blending adjacent
-    frames.  Not as good as real optical-flow RIFE but provides correct
-    frame counts and reasonable visual quality for testing.
+    This is useful to stress the scheduler, but it is not a valid substitute
+    for real RIFE quality and must never be treated as production output.
     """
 
     def __init__(self, device: str):
@@ -403,19 +395,6 @@ class _BlendInterpolator:
         """Return the mid-frame between f0 and f1 via alpha blending."""
         import numpy as _np
         return (f0.astype(_np.uint16) + f1.astype(_np.uint16) + 1) // 2
-
-
-class _IFNetWrapper:
-    """Wrapper around loaded IFNet state dict for frame interpolation."""
-
-    def __init__(self, state_dict: dict, device: str):
-        self._device = device
-        # Placeholder: a full implementation would reconstruct IFNet architecture
-        # and load the state dict.  For now, fall back to blend.
-        self._fallback = _BlendInterpolator(device)
-
-    def interpolate(self, f0, f1):
-        return self._fallback.interpolate(f0, f1)
 
 
 # ── Factory ──────────────────────────────────────────────────────────────────
@@ -436,9 +415,19 @@ def create_backend(profile: RIFEBackendProfile | None = None) -> RIFEBackend:
 
     if backend_name == "torch":
         gpu = effective_gpu
-        model = getattr(profile, "model_name", "rife46")
+        model = getattr(profile, "model_name", C.RIFE_TORCH_MODEL_NAME)
         device = os.getenv("ENHANCE_RIFE_DEVICE", getattr(profile, "device", "cuda"))
-        return TorchBackend(gpu=gpu, model_name=model, device=device)
+        model_file = os.getenv("ENHANCE_RIFE_TORCH_MODEL_FILE", "")
+        model_dir = os.getenv("ENHANCE_RIFE_TORCH_MODEL_DIR", "")
+        cpu_threads = int(os.getenv("ENHANCE_RIFE_TORCH_THREADS", str(C.RIFE_TORCH_THREADS)))
+        return TorchBackend(
+            gpu=gpu,
+            model_name=model,
+            device=device,
+            model_file=model_file or None,
+            model_dir=model_dir or None,
+            cpu_threads=cpu_threads,
+        )
 
     # Default: ncnn
     gpu = effective_gpu
