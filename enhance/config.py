@@ -82,6 +82,8 @@ RIFE_FILE_SETTLE_SECONDS = float(os.getenv("ENHANCE_RIFE_FILE_SETTLE_SECONDS", "
 # direct streaming. This can improve occupancy, but on the RTX 2060 it may run
 # out of VRAM with real_x2plus quality profiles.
 SHARE_RIFE_GPU = os.getenv("ENHANCE_SHARE_RIFE_GPU", "0") == "1"
+RIFE_SHARED_ESRGAN_TILE = max(int(os.getenv("ENHANCE_RIFE_SHARED_ESRGAN_TILE", "256")), 0)
+RIFE_SHARED_ESRGAN_PAD = max(int(os.getenv("ENHANCE_RIFE_SHARED_ESRGAN_PAD", "16")), 0)
 PIPELINE_DEPTH = max(int(os.getenv("ENHANCE_PIPELINE_DEPTH", "2")), 1)
 MAX_EXTRACT_BYTES_IN_FLIGHT = max(
     int(os.getenv("ENHANCE_MAX_EXTRACT_BYTES_IN_FLIGHT", str(6 * 1024**3))), 1

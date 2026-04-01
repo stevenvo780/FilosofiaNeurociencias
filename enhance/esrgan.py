@@ -52,6 +52,11 @@ class ESRGANEngine:
             name = torch.cuda.get_device_name(gid)
             bs = self.batches[idx]
             print(f"  [ESRGAN] GPU{gid} {name}  batch={bs}")
+            if C.SHARE_RIFE_GPU and gid == C.RIFE_GPU and C.RIFE_SHARED_ESRGAN_TILE > 0:
+                print(
+                    f"    shared-with-RIFE  tile={C.RIFE_SHARED_ESRGAN_TILE} "
+                    f"pad={C.RIFE_SHARED_ESRGAN_PAD}"
+                )
 
             model_path = self._resolve_model_path()
             m = spandrel.ModelLoader().load_from_file(model_path)
@@ -125,6 +130,68 @@ class ESRGANEngine:
         except Exception as exc:
             print(f"    compile=off  reason={exc}", flush=True)
             return net
+
+    def _use_tiled_shared_rife(self, dev_id: int) -> bool:
+        return (
+            C.SHARE_RIFE_GPU
+            and dev_id == C.RIFE_GPU
+            and C.RIFE_SHARED_ESRGAN_TILE > 0
+        )
+
+    def _infer_tiled_u8(self, net, t_small, tile_size: int, tile_pad: int):
+        """Run tiled inference to fit ESRGAN on low-VRAM shared GPUs."""
+        torch = self.torch
+        n, c, h, w = t_small.shape
+        scale = self.scale
+        out_u8 = torch.empty(
+            (n, c, h * scale, w * scale),
+            dtype=torch.uint8,
+            device=t_small.device,
+        )
+
+        for bi in range(n):
+            img = t_small[bi : bi + 1]
+            for y in range(0, h, tile_size):
+                y_end = min(y + tile_size, h)
+                y0 = max(y - tile_pad, 0)
+                y1 = min(y_end + tile_pad, h)
+                for x in range(0, w, tile_size):
+                    x_end = min(x + tile_size, w)
+                    x0 = max(x - tile_pad, 0)
+                    x1 = min(x_end + tile_pad, w)
+
+                    tile = img[:, :, y0:y1, x0:x1]
+                    with torch.inference_mode():
+                        out_tile = net(tile)
+                    out_tile_u8 = (out_tile.clamp(0, 1) * 255).byte()
+
+                    crop_top = (y - y0) * scale
+                    crop_bottom = crop_top + (y_end - y) * scale
+                    crop_left = (x - x0) * scale
+                    crop_right = crop_left + (x_end - x) * scale
+                    out_u8[
+                        bi : bi + 1,
+                        :,
+                        y * scale : y_end * scale,
+                        x * scale : x_end * scale,
+                    ] = out_tile_u8[:, :, crop_top:crop_bottom, crop_left:crop_right]
+                    del tile, out_tile, out_tile_u8
+
+        return out_u8
+
+    def _run_model_to_u8(self, net, t_small, dev_id: int):
+        if self._use_tiled_shared_rife(dev_id):
+            return self._infer_tiled_u8(
+                net,
+                t_small,
+                C.RIFE_SHARED_ESRGAN_TILE,
+                C.RIFE_SHARED_ESRGAN_PAD,
+            )
+        with self.torch.inference_mode():
+            out = net(t_small)
+        out_u8 = (out.clamp(0, 1) * 255).byte()
+        del out
+        return out_u8
 
     def _gpu_worker(self, worker_idx: int, dev_id: int,
                     frames: list[np.ndarray], get_batch: Callable,
@@ -313,11 +380,9 @@ class ESRGANEngine:
                     ds_ev1.record()
 
                     inf_ev0.record()
-                    with torch.inference_mode():
-                        out = net(t_small)
+                    out_u8 = self._run_model_to_u8(net, t_small, dev_id)
                     inf_ev1.record()
 
-                    out_u8 = (out.clamp(0, 1) * 255).byte()
                     # Permute to NHWC and make contiguous on GPU (fast)
                     out_gpu_nhwc = out_u8.permute(0, 2, 3, 1).contiguous()
 
@@ -403,7 +468,7 @@ class ESRGANEngine:
                                   flush=True)
 
                 # Cleanup GPU tensors (pinned D2H buffers are reused)
-                del cpu_batch, t_gpu, t_small, out, out_u8, out_gpu_nhwc
+                del cpu_batch, t_gpu, t_small, out_u8, out_gpu_nhwc
 
             # ----- Default (non-pinned) fallback path --------------------
             else:
@@ -430,12 +495,10 @@ class ESRGANEngine:
                 downscale_dt = time.time() - downscale_t0
 
                 infer_t0 = time.time()
-                with torch.inference_mode():
-                    out = net(t_small)
+                out_u8 = self._run_model_to_u8(net, t_small, dev_id)
                 infer_dt = time.time() - infer_t0
 
                 d2h_t0 = time.time()
-                out_u8 = (out.clamp(0, 1) * 255).byte()
                 # Permute+contiguous on GPU, then async D2H to pinned buffer
                 out_gpu_nhwc = out_u8.permute(0, 2, 3, 1).contiguous()
 
@@ -485,7 +548,7 @@ class ESRGANEngine:
                         telemetry["d2h"] = telemetry.get("d2h", 0.0) + d2h_dt
                         telemetry["writer_wait"] = telemetry.get("writer_wait", 0.0) + writer_wait_dt
 
-                del batch_np, t_gpu, t_small, out, out_u8, out_gpu_nhwc
+                del batch_np, t_gpu, t_small, out_u8, out_gpu_nhwc
 
                 with lock:
                     counter[0] += cur_bs

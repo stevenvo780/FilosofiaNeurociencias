@@ -932,6 +932,45 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
             "started_at": time.time(),
         }
 
+    def _spawn_next_prefetch() -> dict:
+        """Wait for the next extracted chunk and start RIFE immediately."""
+        state = {
+            "item": no_item,
+            "prefetch": None,
+            "error": None,
+            "ready": threading.Event(),
+        }
+
+        def runner():
+            try:
+                item = in_q.get()
+                state["item"] = item
+                if item is None or C.shutdown.is_set():
+                    return
+
+                if len(item) == 3:
+                    next_cid, _, next_raw = item
+                else:
+                    next_cid, next_raw = item[0], None
+
+                if (
+                    next_raw is not None
+                    and next_cid is not None
+                    and not prog.done(next_cid, "encode")
+                ):
+                    state["prefetch"] = _start_rife_prefetch(next_cid, next_raw)
+            except BaseException as exc:
+                state["error"] = exc
+            finally:
+                state["ready"].set()
+
+        threading.Thread(
+            target=runner,
+            daemon=True,
+            name="RIFE Prefetch",
+        ).start()
+        return state
+
     while True:
         if carried_item is not no_item:
             item = carried_item
@@ -996,23 +1035,9 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                         backend.wait(prefetched["handle"], timeout=5)
                 prefetched = None
 
+            prefetch_watch = None
             if rife_prefetch_safe and carried_item is no_item:
-                try:
-                    carried_item = in_q.get_nowait()
-                except queue.Empty:
-                    carried_item = no_item
-
-            if rife_prefetch_safe and carried_item is not no_item and carried_item is not None:
-                if len(carried_item) == 3:
-                    next_cid, _, next_raw = carried_item
-                else:
-                    next_cid, next_raw = carried_item[0], None
-                if (
-                    next_raw is not None
-                    and next_cid is not None
-                    and not prog.done(next_cid, "encode")
-                ):
-                    prefetched = _start_rife_prefetch(next_cid, next_raw)
+                prefetch_watch = _spawn_next_prefetch()
 
             stats = _stream_rife_esrgan_to_nvenc(
                 esr,
@@ -1028,6 +1053,14 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                 metrics,
                 prefetched=current_prefetch,
             )
+
+            if prefetch_watch is not None:
+                prefetch_watch["ready"].wait()
+                if prefetch_watch["error"] is not None:
+                    raise RuntimeError("Next-chunk RIFE prefetch failed") from prefetch_watch["error"]
+                carried_item = prefetch_watch["item"]
+                prefetched = prefetch_watch["prefetch"]
+
             prog.mark(cid, "rife")
             prog.mark(cid, "esrgan")
             prog.mark(cid, "encode")

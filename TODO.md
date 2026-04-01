@@ -7,7 +7,7 @@
 >
 > **Producción**: Video 1 (Recording) ya fue procesado con modelo anime (30 GB, 4480×2520@50fps, 7.4h). Se relanza con perfil `quality` (real_x2plus + face_adaptive). Video 2 (Gallery) solo tenía 9/1774 chunks. Audio enhanced existente usa `dynaudnorm` (viejo) — se reemplaza con perfil `natural`.
 >
-> **Validación Codex (2026-04-01)**: `quality/real_x2plus` no revalida todavía el gate. Con `GPU0_BATCH=16` hay `CUDA OOM`; con `GPU0_BATCH=4` evita el OOM, pero en una prueba de `60s` solo saturó de forma sostenida a `GPU0`, dejó `GPU1` mayormente ociosa y no completó el chunk dentro de `304s`.
+> **Validación Codex (2026-04-01)**: `quality/real_x2plus` no revalida todavía el gate. Con `GPU0_BATCH=16` hay `CUDA OOM`; con `GPU0_BATCH=4` evita el OOM, pero en una prueba de `60s` solo saturó de forma sostenida a `GPU0`, dejó `GPU1` mayormente ociosa y no completó el chunk dentro de `304s`. Se probó además un modo experimental para compartir `GPU1` entre `RIFE` y `ESRGAN`: sin tiling sube el uso de ambas GPUs, pero la `RTX 2060` hace `OOM` incluso con `GPU1_BATCH=1`; con tiling (`256/16`) evita ese `OOM`, pero sigue sin cerrar un chunk de `15s` en tiempo razonable.
 
 > **Nota**: El diagnóstico detallado de abajo conserva parte del baseline original. El estado real por tarea y los benchmarks recientes quedan resumidos aquí.
 
