@@ -6,6 +6,7 @@ without touching the rest of the codebase.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -428,13 +429,15 @@ def create_backend(profile: RIFEBackendProfile | None = None) -> RIFEBackend:
     """
     backend_name = getattr(profile, "backend", "ncnn") if profile is not None else "ncnn"
 
+    effective_gpu = int(os.getenv("ENHANCE_RIFE_GPU", str(getattr(profile, "gpu", C.RIFE_GPU) if profile is not None else C.RIFE_GPU)))
+
     if backend_name == "torch":
-        gpu = getattr(profile, "gpu", 0)
+        gpu = effective_gpu
         model = getattr(profile, "model_name", "rife46")
         return TorchBackend(gpu=gpu, model_name=model)
 
     # Default: ncnn
-    gpu = getattr(profile, "gpu", C.RIFE_GPU) if profile is not None else C.RIFE_GPU
+    gpu = effective_gpu
     threads = getattr(profile, "threads", C.RIFE_THREADS) if profile is not None else C.RIFE_THREADS
     rife_bin = getattr(profile, "rife_bin", None) if profile is not None else None
     model_dir = getattr(profile, "model_dir", None) if profile is not None else None

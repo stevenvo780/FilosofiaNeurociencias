@@ -22,15 +22,30 @@ export ENHANCE_MAX_EXTRACT_BYTES_IN_FLIGHT="${ENHANCE_MAX_EXTRACT_BYTES_IN_FLIGH
 export ENHANCE_MAX_RIFE_READY_BYTES="${ENHANCE_MAX_RIFE_READY_BYTES:-3221225472}"
 export ENHANCE_ENABLE_JSONL_METRICS="${ENHANCE_ENABLE_JSONL_METRICS:-1}"
 export ENHANCE_ESRGAN_PINNED_STAGING="${ENHANCE_ESRGAN_PINNED_STAGING:-1}"
-export ENHANCE_GPU0_BATCH="${ENHANCE_GPU0_BATCH:-16}"
-export ENHANCE_GPU1_BATCH="${ENHANCE_GPU1_BATCH:-4}"
-export ENHANCE_CHUNK_SECONDS="${ENHANCE_CHUNK_SECONDS:-20}"
 
 # ── Profile selection (quality + throughput defaults) ────────
 export ENHANCE_VISUAL_PROFILE="${ENHANCE_VISUAL_PROFILE:-quality}"
 export ENHANCE_AUDIO_PROFILE="${ENHANCE_AUDIO_PROFILE:-natural}"
-export ENHANCE_SCHEDULER_PROFILE="${ENHANCE_SCHEDULER_PROFILE:-split_l3_a}"
+export ENHANCE_SCHEDULER_PROFILE="${ENHANCE_SCHEDULER_PROFILE:-production}"
 export ENHANCE_RIFE_BACKEND="${ENHANCE_RIFE_BACKEND:-baseline}"
+# Experimental: enabling this makes ESRGAN share GPU1 with RIFE. It raises
+# occupancy, but quality/real_x2plus currently OOMs on the RTX 2060.
+export ENHANCE_SHARE_RIFE_GPU="${ENHANCE_SHARE_RIFE_GPU:-0}"
+export ENHANCE_CHUNK_SECONDS="${ENHANCE_CHUNK_SECONDS:-30}"
+
+# real_x2plus at full input resolution is not safe with batch=16 on the 5070 Ti.
+# Keep a conservative default for the real-world quality profiles while retaining
+# the larger batch for lighter anime/downscaled profiles.
+case "${ENHANCE_VISUAL_PROFILE}" in
+  quality|face_preserve|production|real_x2|real_x2plus)
+    DEFAULT_GPU0_BATCH=4
+    ;;
+  *)
+    DEFAULT_GPU0_BATCH=16
+    ;;
+esac
+export ENHANCE_GPU0_BATCH="${ENHANCE_GPU0_BATCH:-$DEFAULT_GPU0_BATCH}"
+export ENHANCE_GPU1_BATCH="${ENHANCE_GPU1_BATCH:-4}"
 
 run_video() {
   local input="$1"

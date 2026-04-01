@@ -565,7 +565,8 @@ class ESRGANEngine:
                       store: list | None,
                       on_frame: Callable | None,
                       log_progress: bool = True,
-                      telemetry: dict[str, float] | None = None) -> int:
+                      telemetry: dict[str, float] | None = None,
+                      active_gpu_ids: list[int] | None = None) -> int:
         """Dispatch dynamically fetching threads."""
         total = len(frames)
         if total == 0:
@@ -601,30 +602,16 @@ class ESRGANEngine:
             thread.start()
             threads.append(thread)
 
-        # Deploy fetching worker for GPU0 (Fastest: Pulls 8 frames automatically)
-        launch(
-            self._gpu_worker,
-            0,
-            self.gpu_ids[0],
-            frames,
-            get_batch,
-            store,
-            on_frame,
-            counter,
-            lock,
-            total,
-            t0,
-            log_progress,
-            telemetry,
-            telemetry_lock,
-        )
-        
-        # Deploy fetching worker for GPU1 (Slightly Slower: Pulls 4 frames automatically)
-        if self.ngpu > 1:
+        enabled_gpu_ids = set(active_gpu_ids or self.gpu_ids)
+
+        # Deploy fetching workers only on GPUs enabled for this pass.
+        for worker_idx, gpu_id in enumerate(self.gpu_ids):
+            if gpu_id not in enabled_gpu_ids:
+                continue
             launch(
                 self._gpu_worker,
-                1,
-                self.gpu_ids[1],
+                worker_idx,
+                gpu_id,
                 frames,
                 get_batch,
                 store,
@@ -695,11 +682,13 @@ class ESRGANEngine:
     def process_streaming(self, frames: list[np.ndarray],
                           on_frame: Callable[[int, np.ndarray], None],
                           log_progress: bool = True,
-                          telemetry: dict[str, float] | None = None) -> int:
+                          telemetry: dict[str, float] | None = None,
+                          active_gpu_ids: list[int] | None = None) -> int:
         return self._run_parallel(
             frames,
             store=None,
             on_frame=on_frame,
             log_progress=log_progress,
             telemetry=telemetry,
+            active_gpu_ids=active_gpu_ids,
         )

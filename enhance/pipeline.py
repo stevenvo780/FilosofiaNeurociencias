@@ -448,6 +448,12 @@ def _cleanup_chunk_dir(path: Path):
     shutil.rmtree(path, ignore_errors=True)
 
 
+def _safe_nvenc_gpus() -> list[int]:
+    """Avoid placing NVENC on the same GPU that is busy running RIFE."""
+    safe = [gpu for gpu in C.NVENC_GPUS if gpu != C.RIFE_GPU]
+    return safe or list(C.NVENC_GPUS)
+
+
 def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
                                  rife_in: Path, out_file: Path,
                                  fps: float, gpu: int, cid: int,
@@ -554,8 +560,10 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
                 extract_peak = max(extract_peak, extract_total)
                 rife_ready_peak = max(rife_ready_peak, rife_ready_total)
 
+            rife_rc = rife_backend.poll(rife_handle)
+            rife_running = rife_rc is None
             ready_enough = len(ready_paths) >= C.RIFE_MIN_WINDOW or (
-                rife_backend.poll(rife_handle) is not None and len(ready_paths) > 0
+                not rife_running and len(ready_paths) > 0
             )
             if ready_enough:
                 if budget is not None:
@@ -576,11 +584,29 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
 
                 ready_count = len(frames)
                 offset = next_idx
+                active_gpu_ids = list(esr.gpu_ids)
+                if (
+                    rife_running
+                    and not C.SHARE_RIFE_GPU
+                    and C.RIFE_GPU in active_gpu_ids
+                ):
+                    # Conservative mode: keep the RIFE GPU free while Vulkan is
+                    # still producing frames for the current chunk.
+                    safe_gpu_ids = [gid for gid in active_gpu_ids if gid != C.RIFE_GPU]
+                    if safe_gpu_ids:
+                        active_gpu_ids = safe_gpu_ids
+                    elif rife_running:
+                        rc = rife_backend.wait(rife_handle)
+                        rife_running = False
+                        rife_rc = rc
+                        if rc != 0 and not C.shutdown.is_set():
+                            raise RuntimeError(f"RIFE failed for chunk {cid:04d} (rc={rc})")
                 produced = esr.process_streaming(
                     frames,
                     lambda idx, frame, base=offset: writer.on_frame(base + idx, frame),
                     log_progress=False,
                     telemetry=esr_stats,
+                    active_gpu_ids=active_gpu_ids,
                 )
                 if produced != ready_count:
                     raise RuntimeError(
@@ -591,6 +617,14 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
                 window_count += 1
                 window_total += ready_count
                 window_max = max(window_max, ready_count)
+                gpu_desc = ",".join(str(gid) for gid in active_gpu_ids)
+                print(
+                    f"    Chunk {cid:04d} window {window_count}: "
+                    f"{ready_count} frames via GPU[{gpu_desc}] "
+                    f"(rife_running={'yes' if rife_running else 'no'}) "
+                    f"({next_idx}/{expected})",
+                    flush=True,
+                )
                 # T14: batch unlink all consumed paths at once
                 for path in ready_paths[:ready_count]:
                     try:
@@ -604,10 +638,9 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
                     extract_peak = max(extract_peak, extract_total)
                 continue
 
-            rc = rife_backend.poll(rife_handle)
-            if rc is not None:
-                if rc != 0 and not C.shutdown.is_set():
-                    raise RuntimeError(f"RIFE failed for chunk {cid:04d} (rc={rc})")
+            if rife_rc is not None:
+                if rife_rc != 0 and not C.shutdown.is_set():
+                    raise RuntimeError(f"RIFE failed for chunk {cid:04d} (rc={rife_rc})")
                 if next_idx >= expected:
                     break
             time.sleep(C.RIFE_POLL_SECONDS)
@@ -880,8 +913,10 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
     current chunk.  Since RIFE runs on GPU1 via Vulkan and ESRGAN uses GPU0
     via CUDA, they execute truly in parallel on different GPUs.
     """
-    carried_item = None
+    no_item = object()
+    carried_item = no_item
     prefetched: dict | None = None
+    rife_prefetch_safe = esr is not None and C.RIFE_GPU not in set(esr.gpu_ids)
 
     def _start_rife_prefetch(cid_pf: int, raw_dir_pf: Path) -> dict:
         """Start RIFE for the next chunk before the current ESRGAN begins."""
@@ -898,9 +933,9 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
         }
 
     while True:
-        if carried_item is not None:
+        if carried_item is not no_item:
             item = carried_item
-            carried_item = None
+            carried_item = no_item
         else:
             item = in_q.get()
         if item is None:
@@ -943,7 +978,8 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
         n = len(frames) if frames is not None else 0
 
         if do_esr and esr and do_rife and raw_dir is not None:
-            gpu = C.NVENC_GPUS[cid % len(C.NVENC_GPUS)]
+            safe_nvenc_gpus = _safe_nvenc_gpus()
+            gpu = safe_nvenc_gpus[cid % len(safe_nvenc_gpus)]
             expected = create_backend(rife_backend_profile).expected_output_frames(
                 _count_numbered_pngs(raw_dir)
             )
@@ -960,13 +996,13 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                         backend.wait(prefetched["handle"], timeout=5)
                 prefetched = None
 
-            if carried_item is None:
+            if rife_prefetch_safe and carried_item is no_item:
                 try:
                     carried_item = in_q.get_nowait()
                 except queue.Empty:
-                    carried_item = None
+                    carried_item = no_item
 
-            if carried_item is not None:
+            if rife_prefetch_safe and carried_item is not no_item and carried_item is not None:
                 if len(carried_item) == 3:
                     next_cid, _, next_raw = carried_item
                 else:
@@ -997,6 +1033,8 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
             prog.mark(cid, "encode")
             prog.mark(cid, "clean")
             produced = int(stats["produced"])
+            if produced == 0 and vid.exists() and vid.stat().st_size > 1000:
+                produced = expected
             dt_total = stats["total_seconds"]
             dt_rife = stats["rife_seconds"]
             dt_read = stats["readback_seconds"]

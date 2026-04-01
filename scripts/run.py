@@ -44,11 +44,11 @@ def main():
     ap.add_argument("--outdir", type=str, default=None,
                     help="Output directory (default: <input_dir>/enhanced)")
     ap.add_argument("--visual-profile", type=str, default=None,
-                    help="Visual quality profile (baseline, real_x2, hybrid_detail, face_adaptive)")
+                    help="Visual quality profile (baseline, real_x2, real_x2plus, real_x4plus, hybrid_detail, face_adaptive, quality, face_preserve, production)")
     ap.add_argument("--audio-profile", type=str, default=None,
-                    help="Audio processing profile (baseline, conservative, voice, natural)")
+                    help="Audio processing profile (baseline, conservative, voice, natural, voice_natural, lecture_natural, production)")
     ap.add_argument("--scheduler-profile", type=str, default=None,
-                    help="CPU scheduler profile (baseline, split_l3_a, split_l3_b)")
+                    help="CPU scheduler profile (baseline, split_l3_a, split_l3_b, production)")
     ap.add_argument("--rife-backend", type=str, default=None,
                     help="RIFE backend (baseline, torch)")
     ap.add_argument("--rife-threads", type=str, default=None,
@@ -78,11 +78,12 @@ def main():
 
     effective_chunk = args.chunk if args.chunk is not None else sp.chunk_seconds or C.CHUNK_SECONDS
     effective_rife_threads = args.rife_threads or os.environ.get("ENHANCE_RIFE_THREADS") or sp.rife_threads or C.RIFE_THREADS
+    effective_rife_gpu = int(os.environ.get("ENHANCE_RIFE_GPU", str(rp.gpu)))
 
     # Override config from profiles where applicable
     C.CHUNK_SECONDS = effective_chunk
     C.RIFE_THREADS = effective_rife_threads
-    C.RIFE_GPU = rp.gpu
+    C.RIFE_GPU = effective_rife_gpu
     C.RIFE_STREAM_WINDOW = rp.stream_window
     C.RIFE_MIN_WINDOW = rp.min_window
     C.RIFE_POLL_SECONDS = rp.poll_seconds

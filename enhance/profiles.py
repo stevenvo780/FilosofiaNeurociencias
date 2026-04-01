@@ -245,7 +245,7 @@ SCHEDULER_PROFILES: Dict[str, SchedulerProfile] = {
         ionice_class=2,
         ionice_level=0,
         use_chrt=True,
-        chunk_seconds=20,
+        chunk_seconds=30,
         rife_threads="1:8:4",
     ),
 }

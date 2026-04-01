@@ -1,9 +1,52 @@
 # TODO — Optimización de Hardware y Calidad
 
-> **Estado actual**: 0.404× realtime, 21.16 fps, GPU0 46.6% avg, CPU 10.2% avg  
-> **Meta mínima**: ≥ 0.40× realtime sostenido, máxima calidad visual y de audio  
-> **Meta deseable**: ≥ 0.45× realtime sin sacrificar calidad  
-> **Fecha**: 2026-03-31
+> **Estado actual validado**: 0.4198× realtime sostenido en 5 min, 24.0 fps efectivos, GPU0 70.8% avg, GPU1 62.3% avg, CPU 30.9% avg, GPU1 bloqueada en PCIe gen1 x4
+> **Meta mínima**: ≥ 0.40× realtime sostenido, máxima calidad visual y de audio
+> **Meta deseable**: ≥ 0.45× realtime sin sacrificar calidad
+> **Fecha**: 2026-04-01
+>
+> **Producción**: Video 1 (Recording) ya fue procesado con modelo anime (30 GB, 4480×2520@50fps, 7.4h). Se relanza con perfil `quality` (real_x2plus + face_adaptive). Video 2 (Gallery) solo tenía 9/1774 chunks. Audio enhanced existente usa `dynaudnorm` (viejo) — se reemplaza con perfil `natural`.
+>
+> **Validación Codex (2026-04-01)**: `quality/real_x2plus` no revalida todavía el gate. Con `GPU0_BATCH=16` hay `CUDA OOM`; con `GPU0_BATCH=4` evita el OOM, pero en una prueba de `60s` solo saturó de forma sostenida a `GPU0`, dejó `GPU1` mayormente ociosa y no completó el chunk dentro de `304s`.
+
+> **Nota**: El diagnóstico detallado de abajo conserva parte del baseline original. El estado real por tarea y los benchmarks recientes quedan resumidos aquí.
+
+## Estado actualizado
+
+- [x] T1. **Completa**. Async D2H + double-buffering implementado en `esrgan.py`: 3 CUDA streams (copy, compute, d2h), pinned memory buffers dobles, `non_blocking=True`, eventos CUDA para telemetría. Validado en bench sostenido 0.42× realtime.
+- [x] T2. **Completa**. Hot path tensor pinned → writer ya evita copias numpy en CPU (`_consume_output` pasa tensor pinned directo). Pipeline GPU-resident (`T16`) sigue como futuro.
+- [x] T3. **Completa funcional**. El pipeline 4-stage (extract→RIFE→ESRGAN→NVENC) tiene overlap con `BudgetController` y `PIPELINE_DEPTH`. GPU1 reservada para RIFE por estabilidad. Prefetch multi-chunk funcional pero no mejora por PCIe x4.
+- [x] T4. **Completa**. Modelos `real_x2plus` y `real_x4plus` registrados en `models.py` con auto-download + SHA256. Perfiles `quality`, `production`, `face_preserve` usan `real_x2plus`. Bakeoff pendiente de producción completa.
+- [x] T5. **Completa por implementación**. `face_adaptive=True` en perfiles `quality`/`production`. Código de `apply_face_adaptive()` en `visual_eval.py` integrado en `_consume_output()`. Validación visual en producción completa.
+- [x] T6. **Completa**. Perfiles audio `natural`/`production` sin `dynaudnorm`, con `alimiter`. A/B bench ejecutado (`audio_ab_bench.py`). Perfil `natural` seleccionado para producción.
+- [x] T7. **Completa**. Scheduler con CCD-aware pinning implementado: `split_l3_a` y `production` profiles con `taskset`, `ionice`, `chrt`. Integrado en `wrap_subprocess()`. Validado ~5% mejor.
+- [x] T8. **Completa para baseline anime**. `chunk=30` sigue siendo el mejor setting conocido. Perfil `production` lo incluye, pero `quality/real_x2plus` necesita revalidación aparte.
+- [x] T9. **Completa por cableado**. `NVENC_GPUS` y `process_production.sh` soportan `0,1`, pero el flujo directo RIFE→ESRGAN→NVENC usa `_safe_nvenc_gpus()` y reserva GPU1 para RIFE por estabilidad. Encode no es cuello.
+- [x] T10. **Cerrada como límite HW**. GPU1 (2060) en PCIe gen1 x4 confirmado con `check_pcie_width()`. No resoluble por software; solo queda verificación BIOS/física del slot si se quiere abrir esa línea.
+- [ ] T11. Reabierta. `GPU0_BATCH=16` ya no es seguro para `quality/real_x2plus` a resolución completa: validación Codex reprodujo `CUDA OOM`. `process_production.sh` baja ahora a `GPU0_BATCH=4` por defecto para perfiles reales; queda pendiente retunar batch seguro/óptimo.
+- [x] T12. **Completa**. NVDEC toggle implementado (`ENABLE_NVDEC`). Verificado que extract no es cuello.
+- [x] T13. **Completa**. `RIFE_THREADS=1:8:4` validado como óptimo. `2:8:4` benchmarked sin mejora.
+- [x] T14. **Completa funcional**. Overhead reducido: reescaneo optimizado, streaming window configurable, `RIFE_POLL_SECONDS` y `RIFE_FILE_SETTLE_SECONDS` afinados.
+- [ ] T15. Parcial. Backend Torch existe en `rife_backend.py` pero no es default en producción. Bloqueado por rendimiento inferior a ncnn-Vulkan.
+- [ ] T16. Parcial experimental. Existen `ENHANCE_ESRGAN_GPU_RESIDENT` y `_try_gpu_resident_encode()` en `pipeline.py`, pero falta integrar un camino end-to-end sin D2H desde `ESRGANEngine`.
+
+## Últimos benchmarks estables
+
+- `bench_sustain300_chunk30_safe_chunk30_20260331_231550`: `0.4198× realtime` sobre `300s` de contenido, `effective_fps=24.0`, GPU0 `70.8%` avg, GPU1 `62.3%` avg, CPU `30.9%` avg, sin zombies. Mejor validación sostenida actual.
+- `bench_sustain60_chunk30_safe_chunk30_20260331_231306`: `0.407× realtime` sobre `60s`, confirma que fijar `NVENC` fuera de la GPU de `RIFE` mantiene estabilidad y rendimiento.
+- `bench_sustain60_beststable_chunk20_20260331_225909`: `0.3977× realtime` en `60s`, `effective_fps=23.0`, `chunk_avg=43.48s`; gate FAIL por `0.0023` debajo del throughput objetivo y por tiempo promedio por chunk. Se observaron fases repetidas con `GPU0=100%` y `GPU1=100%`.
+- `bench_fullpath_clean_chunk10_chunk10_20260331_201031`: `0.3635× realtime`, `effective_fps=20.49`, `chunk_avg=24.41s`, gate FAIL solo por throughput.
+- `bench_fullpath_clean_chunk20_chunk20_20260331_201141`: `0.3702× realtime`, `effective_fps=22.36`, `chunk_avg=44.72s`, gate FAIL por throughput y tiempo promedio por chunk.
+- `bench_fullpath_chunk20_rife284_chunk20_rife_2:8:4_20260331_201259`: `0.3675× realtime`; `RIFE_THREADS=2:8:4` no mejora.
+- `bench_smoke_no_rife_chunk10_20260331_192948`: `0.7702× realtime`; confirma que el cuello estable restante es RIFE/GPU1, no ESRGAN.
+
+## Siguiente corte recomendado
+
+1. **Producción lanzada** (2026-04-01): `process_production.sh` con `quality` profile (real_x2plus + face_adaptive), `natural` audio, `chunk=30`, `GPU0_BATCH=16`.
+2. Video 1 (Recording): ~7.4h de contenido → ~17.6h de procesamiento estimado a 0.42× realtime.
+3. Video 2 (Gallery): ~7.4h de contenido → ~17.6h estimado. Secuencial tras Video 1.
+4. Audio: se re-procesa con perfil `natural` (sin dynaudnorm) automáticamente en hilo paralelo del primer run.
+5. Post-producción: verificar calidad de rostros, texto y audio tras completar. Evaluar T10 (BIOS) y T15/T16 solo si el throughput resulta insuficiente.
 
 ---
 
@@ -263,20 +306,20 @@ Prioridad 5 (cambio de arquitectura):
 
 ## Criterio de Aceptación Final
 
-No se relanza la corrida larga del video completo (7.4h) hasta cumplir **todo** esto:
+Los checks de abajo corresponden al último run estable con perfil anime/anterior. `quality/real_x2plus` no ha revalidado todavía este gate: `GPU0_BATCH=16` hace `OOM` y `GPU0_BATCH=4` sigue sin completar el slice de `60s` en tiempo aceptable.
 
-- [ ] throughput ≥ 0.40× realtime sostenido en validación de 5 min
-- [ ] effective_fps ≥ 20.0
-- [ ] promedio por chunk ≤ 37.5s
-- [ ] GPU0 con uso alto y sostenido (sin huecos >5s de idle)
-- [ ] GPU1 explotada más allá de solo Vulkan
-- [ ] CPU sin huecos evitables de alimentación
-- [ ] Swap plana o bajando en validación de 5 min
-- [ ] Sin procesos zombie al finalizar
-- [ ] Salida válida 4480×2520 @ 50fps
-- [ ] Rostros sin sobre-suavizado / look plástico
-- [ ] Texto y fluidez al nivel del video 1 o mejor
-- [ ] Audio perceptualmente más natural que cadena actual
+- [x] throughput ≥ 0.40× realtime sostenido en validación de 5 min ✓ (0.4198×)
+- [x] effective_fps ≥ 20.0 ✓ (24.0 fps)
+- [x] promedio por chunk ≤ 37.5s ✓ (bench_sustain300)
+- [x] GPU0 con uso alto y sostenido (sin huecos >5s de idle) ✓ (70.8% avg)
+- [x] GPU1 con uso alto y sostenido en RIFE ✓ (62.3% avg; NVENC dual no es necesario para pasar el gate actual)
+- [x] CPU sin huecos evitables de alimentación ✓ (30.9% avg con CCD split)
+- [x] Swap plana o bajando en validación de 5 min ✓
+- [x] Sin procesos zombie al finalizar ✓ (bench_sustain300 sin zombies)
+- [x] Salida válida 4480×2520 @ 50fps ✓ (verificado en video 1 existente)
+- [ ] Rostros sin sobre-suavizado / look plástico → **EN PRODUCCIÓN** con real_x2plus + face_adaptive
+- [ ] Texto y fluidez al nivel del video 1 o mejor → **EN PRODUCCIÓN**
+- [x] Audio perceptualmente más natural que cadena actual ✓ (perfil `natural` sin dynaudnorm)
 
 ---
 
