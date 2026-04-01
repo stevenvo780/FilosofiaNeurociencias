@@ -7,7 +7,7 @@
 >
 > **Producción**: Video 1 (Recording) ya fue procesado con modelo anime (30 GB, 4480×2520@50fps, 7.4h). Se relanza con perfil `quality` (real_x2plus + face_adaptive). Video 2 (Gallery) solo tenía 9/1774 chunks. Audio enhanced existente usa `dynaudnorm` (viejo) — se reemplaza con perfil `natural`.
 >
-> **Validación Codex (2026-04-01)**: `quality/real_x2plus` no revalida todavía el gate. Con `GPU0_BATCH=16` hay `CUDA OOM`; con `GPU0_BATCH=4` evita el OOM, pero en una prueba de `60s` solo saturó de forma sostenida a `GPU0`, dejó `GPU1` mayormente ociosa y no completó el chunk dentro de `304s`. Se probó además un modo experimental para compartir `GPU1` entre `RIFE` y `ESRGAN`: sin tiling sube el uso de ambas GPUs, pero la `RTX 2060` hace `OOM` incluso con `GPU1_BATCH=1`; con tiling (`256/16`) evita ese `OOM`, pero sigue sin cerrar un chunk de `15s` en tiempo razonable.
+> **Validación Codex (2026-04-01)**: `quality/real_x2plus` no revalida todavía el gate final, pero ya quedó validada la arquitectura correcta para este hardware. Con `GPU0_BATCH=16` hay `CUDA OOM`; con `GPU0_BATCH=4` evita el OOM, pero en una prueba de `60s` solo saturó de forma sostenida a `GPU0`, dejó `GPU1` mayormente ociosa y no completó el chunk dentro de `304s`. Se probó además un modo experimental para compartir `GPU1` entre `RIFE` y `ESRGAN`: sin tiling sube el uso de ambas GPUs, pero la `RTX 2060` hace `OOM` incluso con `GPU1_BATCH=1`; con tiling (`256/16`) evita ese `OOM`, pero sigue sin cerrar un chunk de `15s` en tiempo razonable. La corrección útil fue otra: `ESRGAN` solo en `GPU0` y `RIFE` adelantado solo en `GPU1`. En la validación `bench_codex_hetero45_prefetch4_chunk15_20260401_111910` el prefetch sí arrancó mientras `chunk_0000` seguía en `ESRGAN`, hubo muestra directa de `GPU0=100%` y `GPU1=100%` simultáneas, y el log parcial arrojó `GPU0 91.1%` avg, `GPU1 35.4%` avg, `CPU 23.0%` avg, con `37/117` pares de muestras en `>=80%` para ambas GPUs y sin `OOM`. Ese run quedó interrumpido antes de cerrar el chunk, así que todavía no cierra el gate de throughput.
 
 > **Nota**: El diagnóstico detallado de abajo conserva parte del baseline original. El estado real por tarea y los benchmarks recientes quedan resumidos aquí.
 
@@ -15,7 +15,7 @@
 
 - [x] T1. **Completa**. Async D2H + double-buffering implementado en `esrgan.py`: 3 CUDA streams (copy, compute, d2h), pinned memory buffers dobles, `non_blocking=True`, eventos CUDA para telemetría. Validado en bench sostenido 0.42× realtime.
 - [x] T2. **Completa**. Hot path tensor pinned → writer ya evita copias numpy en CPU (`_consume_output` pasa tensor pinned directo). Pipeline GPU-resident (`T16`) sigue como futuro.
-- [x] T3. **Completa funcional**. El pipeline 4-stage (extract→RIFE→ESRGAN→NVENC) tiene overlap con `BudgetController` y `PIPELINE_DEPTH`. GPU1 reservada para RIFE por estabilidad. Prefetch multi-chunk funcional pero no mejora por PCIe x4.
+- [x] T3. **Completa funcional**. El pipeline 4-stage (extract→RIFE→ESRGAN→NVENC) tiene overlap con `BudgetController` y `PIPELINE_DEPTH`. GPU1 reservada para RIFE por estabilidad. El prefetch multi-chunk quedó corregido para arrancar solo cuando `GPU1` queda libre; en modo heterogéneo (`ESRGAN=GPU0`, `RIFE=GPU1`) ya hay solape real entre ambas GPUs.
 - [x] T4. **Completa**. Modelos `real_x2plus` y `real_x4plus` registrados en `models.py` con auto-download + SHA256. Perfiles `quality`, `production`, `face_preserve` usan `real_x2plus`. Bakeoff pendiente de producción completa.
 - [x] T5. **Completa por implementación**. `face_adaptive=True` en perfiles `quality`/`production`. Código de `apply_face_adaptive()` en `visual_eval.py` integrado en `_consume_output()`. Validación visual en producción completa.
 - [x] T6. **Completa**. Perfiles audio `natural`/`production` sin `dynaudnorm`, con `alimiter`. A/B bench ejecutado (`audio_ab_bench.py`). Perfil `natural` seleccionado para producción.
@@ -23,7 +23,7 @@
 - [x] T8. **Completa para baseline anime**. `chunk=30` sigue siendo el mejor setting conocido. Perfil `production` lo incluye, pero `quality/real_x2plus` necesita revalidación aparte.
 - [x] T9. **Completa por cableado**. `NVENC_GPUS` y `process_production.sh` soportan `0,1`, pero el flujo directo RIFE→ESRGAN→NVENC usa `_safe_nvenc_gpus()` y reserva GPU1 para RIFE por estabilidad. Encode no es cuello.
 - [x] T10. **Cerrada como límite HW**. GPU1 (2060) en PCIe gen1 x4 confirmado con `check_pcie_width()`. No resoluble por software; solo queda verificación BIOS/física del slot si se quiere abrir esa línea.
-- [ ] T11. Reabierta. `GPU0_BATCH=16` ya no es seguro para `quality/real_x2plus` a resolución completa: validación Codex reprodujo `CUDA OOM`. `process_production.sh` baja ahora a `GPU0_BATCH=4` por defecto para perfiles reales; queda pendiente retunar batch seguro/óptimo.
+- [ ] T11. Reabierta. `GPU0_BATCH=16` ya no es seguro para `quality/real_x2plus` a resolución completa: validación Codex reprodujo `CUDA OOM`. `process_production.sh` baja ahora a `GPU0_BATCH=4` y fija `ESRGAN` en `GPU0` por defecto para perfiles reales; queda pendiente retunar batch seguro/óptimo y cerrar el gate de throughput completo en el modo heterogéneo.
 - [x] T12. **Completa**. NVDEC toggle implementado (`ENABLE_NVDEC`). Verificado que extract no es cuello.
 - [x] T13. **Completa**. `RIFE_THREADS=1:8:4` validado como óptimo. `2:8:4` benchmarked sin mejora.
 - [x] T14. **Completa funcional**. Overhead reducido: reescaneo optimizado, streaming window configurable, `RIFE_POLL_SECONDS` y `RIFE_FILE_SETTLE_SECONDS` afinados.
@@ -42,11 +42,11 @@
 
 ## Siguiente corte recomendado
 
-1. **Producción lanzada** (2026-04-01): `process_production.sh` con `quality` profile (real_x2plus + face_adaptive), `natural` audio, `chunk=30`, `GPU0_BATCH=16`.
-2. Video 1 (Recording): ~7.4h de contenido → ~17.6h de procesamiento estimado a 0.42× realtime.
-3. Video 2 (Gallery): ~7.4h de contenido → ~17.6h estimado. Secuencial tras Video 1.
+1. **Producción recomendada** (2026-04-01): `process_production.sh` con `quality` profile (real_x2plus + face_adaptive), `natural` audio, `chunk=30`, `ENHANCE_ESRGAN_GPUS=0`, `ENHANCE_RIFE_GPU=1`, `GPU0_BATCH=4`, `GPU1_BATCH=1`, `ENHANCE_SHARE_RIFE_GPU=0`.
+2. Video 1 (Recording): ~7.4h de contenido. La proyección vieja de `0.42× realtime` corresponde al baseline anime; `quality/real_x2plus` necesita una corrida sostenida nueva con el modo heterogéneo ya corregido.
+3. Video 2 (Gallery): correr secuencial tras revalidar throughput de Video 1 con la configuración heterogénea.
 4. Audio: se re-procesa con perfil `natural` (sin dynaudnorm) automáticamente en hilo paralelo del primer run.
-5. Post-producción: verificar calidad de rostros, texto y audio tras completar. Evaluar T10 (BIOS) y T15/T16 solo si el throughput resulta insuficiente.
+5. Post-producción: verificar calidad de rostros, texto y audio tras completar. Evaluar T10 (BIOS) y T15/T16 solo si el throughput heterogéneo sigue siendo insuficiente.
 
 ---
 

@@ -460,19 +460,11 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
                                  w: int, h: int,
                                  budget: _BudgetController | None = None,
                                  metrics: _MetricsStore | None = None,
-                                 prefetched: dict | None = None) -> dict[str, float]:
+                                 prefetched: dict | None = None,
+                                 next_item_watch: dict | None = None,
+                                 next_prefetch_start=None) -> tuple[dict[str, float], dict | None]:
     """Run RIFE asynchronously and feed ready windows into ESRGAN/NVENC."""
-    if out_file.exists() and out_file.stat().st_size > 1000:
-        prefetched_handle = prefetched.get("handle") if prefetched else None
-        if prefetched_handle is not None:
-            with suppress(Exception):
-                rife_backend.terminate(prefetched_handle)
-            with suppress(Exception):
-                rife_backend.wait(prefetched_handle, timeout=5)
-        if budget is not None:
-            budget.clear_rife_ready(cid)
-            budget.release_extract(cid)
-        _cleanup_chunk_dir(rife_in.parent)
+    def _empty_stream_stats() -> dict[str, float]:
         return {
             "produced": 0,
             "total_seconds": 0.0,
@@ -487,25 +479,26 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
             "nvenc_peak_frames": 0,
         }
 
+    if out_file.exists() and out_file.stat().st_size > 1000:
+        prefetched_handle = prefetched.get("handle") if prefetched else None
+        if prefetched_handle is not None:
+            with suppress(Exception):
+                rife_backend.terminate(prefetched_handle)
+            with suppress(Exception):
+                rife_backend.wait(prefetched_handle, timeout=5)
+        if budget is not None:
+            budget.clear_rife_ready(cid)
+            budget.release_extract(cid)
+        _cleanup_chunk_dir(rife_in.parent)
+        return _empty_stream_stats(), None
+
     expected = rife_backend.expected_output_frames(_count_numbered_pngs(rife_in))
     if expected == 0:
         if budget is not None:
             budget.clear_rife_ready(cid)
             budget.release_extract(cid)
         _cleanup_chunk_dir(rife_in.parent)
-        return {
-            "produced": 0,
-            "total_seconds": 0.0,
-            "rife_seconds": 0.0,
-            "readback_seconds": 0.0,
-            "encode_tail_seconds": 0.0,
-            "window_count": 0,
-            "window_avg_frames": 0.0,
-            "window_max_frames": 0,
-            "rife_ready_peak_bytes": 0,
-            "extract_peak_bytes": 0,
-            "nvenc_peak_frames": 0,
-        }
+        return _empty_stream_stats(), None
 
     prefetched_handle = prefetched.get("handle") if prefetched else None
     prefetched_out = prefetched.get("out_dir") if prefetched else None
@@ -530,6 +523,50 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
     rife_ready_peak = 0
     extract_peak = 0
     esr_stats: dict[str, float] = {}
+    next_prefetch: dict | None = None
+    next_prefetch_error: BaseException | None = None
+    next_prefetch_ready = threading.Event()
+    next_prefetch_cancel = threading.Event()
+
+    def _watch_rife_and_prefetch():
+        nonlocal next_prefetch, next_prefetch_error
+        if next_item_watch is None or next_prefetch_start is None:
+            next_prefetch_ready.set()
+            return
+
+        def runner():
+            nonlocal next_prefetch, next_prefetch_error
+            try:
+                while not C.shutdown.is_set() and not next_prefetch_cancel.is_set():
+                    rc = rife_backend.poll(rife_handle)
+                    if rc is not None:
+                        if rc != 0:
+                            return
+                        break
+                    time.sleep(C.RIFE_POLL_SECONDS)
+
+                while not C.shutdown.is_set() and not next_prefetch_cancel.is_set():
+                    if next_item_watch["ready"].wait(timeout=C.RIFE_POLL_SECONDS):
+                        break
+
+                if C.shutdown.is_set() or next_prefetch_cancel.is_set():
+                    return
+                if next_item_watch["error"] is not None:
+                    raise RuntimeError("Next-chunk RIFE prefetch failed") from next_item_watch["error"]
+
+                next_prefetch = next_prefetch_start(next_item_watch["item"])
+            except BaseException as exc:
+                next_prefetch_error = exc
+            finally:
+                next_prefetch_ready.set()
+
+        threading.Thread(
+            target=runner,
+            daemon=True,
+            name=f"RIFE Prefetch Watch {cid:04d}",
+        ).start()
+
+    _watch_rife_and_prefetch()
 
     try:
         while next_idx < expected:
@@ -657,6 +694,13 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
         nvenc.wait()
         encode_tail_dt = time.time() - t_tail
     except Exception:
+        next_prefetch_cancel.set()
+        if next_prefetch is not None:
+            backend = next_prefetch["backend"]
+            with suppress(Exception):
+                backend.terminate(next_prefetch["handle"])
+            with suppress(Exception):
+                backend.wait(next_prefetch["handle"], timeout=5)
         with suppress(Exception):
             rife_backend.terminate(rife_handle)
         with suppress(Exception):
@@ -673,6 +717,12 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
             budget.clear_rife_ready(cid)
             budget.release_extract(cid)
         _cleanup_chunk_dir(rife_in.parent)
+
+    if not next_prefetch_ready.is_set():
+        next_prefetch_cancel.set()
+        next_prefetch_ready.wait(timeout=max(C.RIFE_POLL_SECONDS * 4, 0.2))
+    if next_prefetch_error is not None:
+        raise RuntimeError("Next-chunk RIFE prefetch failed") from next_prefetch_error
 
     if nvenc.returncode != 0 and not C.shutdown.is_set():
         raise RuntimeError(f"NVENC streaming encode failed (rc={nvenc.returncode})")
@@ -696,7 +746,7 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
         stats[f"esrgan_{key}_seconds"] = value
     if metrics is not None:
         metrics.update(cid, **stats)
-    return stats
+    return stats, next_prefetch
 
 
 def _write_pngs(frames: list[np.ndarray], out_dir: Path):
@@ -924,6 +974,7 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
         rife_out_pf = raw_dir_pf.parent / "rife"
         shutil.rmtree(rife_out_pf, ignore_errors=True)
         handle = backend.start_interpolate(raw_dir_pf, rife_out_pf)
+        print(f"    Prefetch RIFE chunk {cid_pf:04d}: started", flush=True)
         return {
             "backend": backend,
             "cid": cid_pf,
@@ -932,11 +983,26 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
             "started_at": time.time(),
         }
 
-    def _spawn_next_prefetch() -> dict:
-        """Wait for the next extracted chunk and start RIFE immediately."""
+    def _prefetch_item(item) -> dict | None:
+        if item is None:
+            return None
+        if len(item) == 3:
+            next_cid, _, next_raw = item
+        else:
+            next_cid, next_raw = item[0], None
+
+        if (
+            next_raw is not None
+            and next_cid is not None
+            and not prog.done(next_cid, "encode")
+        ):
+            return _start_rife_prefetch(next_cid, next_raw)
+        return None
+
+    def _spawn_next_item_watch() -> dict:
+        """Wait for the next extracted chunk metadata while current work runs."""
         state = {
             "item": no_item,
-            "prefetch": None,
             "error": None,
             "ready": threading.Event(),
         }
@@ -947,18 +1013,6 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                 state["item"] = item
                 if item is None or C.shutdown.is_set():
                     return
-
-                if len(item) == 3:
-                    next_cid, _, next_raw = item
-                else:
-                    next_cid, next_raw = item[0], None
-
-                if (
-                    next_raw is not None
-                    and next_cid is not None
-                    and not prog.done(next_cid, "encode")
-                ):
-                    state["prefetch"] = _start_rife_prefetch(next_cid, next_raw)
             except BaseException as exc:
                 state["error"] = exc
             finally:
@@ -1037,9 +1091,9 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
 
             prefetch_watch = None
             if rife_prefetch_safe and carried_item is no_item:
-                prefetch_watch = _spawn_next_prefetch()
+                prefetch_watch = _spawn_next_item_watch()
 
-            stats = _stream_rife_esrgan_to_nvenc(
+            stats, next_prefetch = _stream_rife_esrgan_to_nvenc(
                 esr,
                 current_prefetch["backend"] if current_prefetch is not None else create_backend(rife_backend_profile),
                 raw_dir,
@@ -1052,6 +1106,8 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                 budget,
                 metrics,
                 prefetched=current_prefetch,
+                next_item_watch=prefetch_watch,
+                next_prefetch_start=_prefetch_item,
             )
 
             if prefetch_watch is not None:
@@ -1059,7 +1115,9 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                 if prefetch_watch["error"] is not None:
                     raise RuntimeError("Next-chunk RIFE prefetch failed") from prefetch_watch["error"]
                 carried_item = prefetch_watch["item"]
-                prefetched = prefetch_watch["prefetch"]
+                prefetched = next_prefetch
+                if prefetched is None and carried_item is not no_item:
+                    prefetched = _prefetch_item(carried_item)
 
             prog.mark(cid, "rife")
             prog.mark(cid, "esrgan")
