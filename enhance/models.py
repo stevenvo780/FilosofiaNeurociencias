@@ -44,6 +44,22 @@ KNOWN_MODELS = [
         scale=2,
         description="Real-ESRGAN x2plus real-world model (x2 native scale)",
     ),
+    ModelEntry(
+        key="real_x2plus",
+        filename="RealESRGAN_x2plus.pth",
+        url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+        sha256="49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb",
+        scale=2,
+        description="Alias for Real-ESRGAN x2plus real-world model",
+    ),
+    ModelEntry(
+        key="real_x4plus",
+        filename="RealESRGAN_x4plus.pth",
+        url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        sha256="4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1",
+        scale=4,
+        description="Real-ESRGAN x4plus general model for real-world scenes",
+    ),
 ]
 
 # ---------------------------------------------------------------------------

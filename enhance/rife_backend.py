@@ -85,6 +85,7 @@ class NCNNBackend(RIFEBackend):
         self._compute_t: float = 0.0
         self._drain_t: float = 0.0
         self._cleanup_t: float = 0.0
+        self._running_t0: float | None = None
 
     # -- helpers ---------------------------------------------------------------
 
@@ -104,6 +105,7 @@ class NCNNBackend(RIFEBackend):
         self._compute_t = 0.0
         self._drain_t = 0.0
         self._cleanup_t = 0.0
+        self._running_t0 = None
 
     # -- ABC implementation ----------------------------------------------------
 
@@ -121,6 +123,7 @@ class NCNNBackend(RIFEBackend):
         t0 = time.monotonic()
         proc = subprocess.Popen(self._build_command(in_dir, out_dir))
         self._spawn_t = time.monotonic() - t0
+        self._running_t0 = time.monotonic()
         return proc
 
     def interpolate_sync(self, in_dir: Path, out_dir: Path) -> int:
@@ -155,7 +158,11 @@ class NCNNBackend(RIFEBackend):
         handle.terminate()
 
     def wait(self, handle: Any, timeout: float | None = None) -> int:
-        return handle.wait(timeout=timeout)
+        rc = handle.wait(timeout=timeout)
+        if self._running_t0 is not None and self._compute_t == 0.0:
+            self._compute_t = time.monotonic() - self._running_t0
+            self._running_t0 = None
+        return rc
 
     def get_metrics(self) -> dict[str, float]:
         return {
@@ -192,6 +199,7 @@ class TorchBackend(RIFEBackend):
         self._compute_t: float = 0.0
         self._drain_t: float = 0.0
         self._cleanup_t: float = 0.0
+        self._running_t0: float | None = None
 
     def _ensure_model(self) -> None:
         """Load IFNet weights for in-memory interpolation.
@@ -250,6 +258,7 @@ class TorchBackend(RIFEBackend):
         )
         thread.start()
         handle._thread = thread
+        self._running_t0 = time.monotonic()
         return handle
 
     def _interpolate_worker(self, in_dir: Path, out_dir: Path,
@@ -331,7 +340,11 @@ class TorchBackend(RIFEBackend):
         C.shutdown.set()
 
     def wait(self, handle: Any, timeout: float | None = None) -> int:
-        return handle.wait(timeout=timeout)
+        rc = handle.wait(timeout=timeout)
+        if self._running_t0 is not None and self._compute_t == 0.0:
+            self._compute_t = time.monotonic() - self._running_t0
+            self._running_t0 = None
+        return rc
 
     def get_metrics(self) -> dict[str, float]:
         return {
@@ -346,6 +359,7 @@ class TorchBackend(RIFEBackend):
         self._compute_t = 0.0
         self._drain_t = 0.0
         self._cleanup_t = 0.0
+        self._running_t0 = None
 
 
 class _TorchHandle:

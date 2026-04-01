@@ -81,27 +81,43 @@ VISUAL_PROFILES: Dict[str, VisualProfile] = {
         model_key="anime_baseline",
         downscale_factor=0.5,
     ),
+    "fast": VisualProfile(
+        name="fast",
+        model_key="anime_baseline",
+        downscale_factor=0.5,
+    ),
     "real_x2": VisualProfile(
         name="real_x2",
         model_key="real_x2",
         downscale_factor=1.0,
     ),
+    "real_x2plus": VisualProfile(
+        name="real_x2plus",
+        model_key="real_x2plus",
+        downscale_factor=1.0,
+    ),
+    "real_x4plus": VisualProfile(
+        name="real_x4plus",
+        model_key="real_x4plus",
+        downscale_factor=0.5,
+        hybrid_detail_weight=0.08,
+    ),
     "hybrid_detail": VisualProfile(
         name="hybrid_detail",
-        model_key="real_x2",
-        downscale_factor=1.0,
-        hybrid_detail_weight=0.3,
+        model_key="real_x4plus",
+        downscale_factor=0.5,
+        hybrid_detail_weight=0.12,
     ),
     "face_adaptive": VisualProfile(
         name="face_adaptive",
-        model_key="real_x2",
+        model_key="real_x2plus",
         downscale_factor=1.0,
         hybrid_detail_weight=0.2,
         face_adaptive=True,
     ),
     "quality": VisualProfile(
         name="quality",
-        model_key="real_x2",
+        model_key="real_x2plus",
         downscale_factor=1.0,
         hybrid_detail_weight=0.15,
         face_adaptive=True,
@@ -109,9 +125,17 @@ VISUAL_PROFILES: Dict[str, VisualProfile] = {
     ),
     "face_preserve": VisualProfile(
         name="face_preserve",
-        model_key="real_x2",
+        model_key="real_x2plus",
         downscale_factor=1.0,
         hybrid_detail_weight=0.25,
+        face_adaptive=True,
+        face_roi=(0.5, 0.0, 1.0, 0.5),
+    ),
+    "production": VisualProfile(
+        name="production",
+        model_key="real_x2plus",
+        downscale_factor=1.0,
+        hybrid_detail_weight=0.15,
         face_adaptive=True,
         face_roi=(0.5, 0.0, 1.0, 0.5),
     ),
@@ -166,6 +190,26 @@ AUDIO_PROFILES: Dict[str, AudioProfile] = {
             "alimiter=level_in=1:level_out=1:limit=0.95:release=50"
         ),
     ),
+    "lecture_natural": AudioProfile(
+        name="lecture_natural",
+        filter_chain=(
+            "highpass=f=80,"
+            "anlmdn=s=7:p=0.002:m=15,"
+            "dialoguenhance,"
+            "loudnorm=I=-16:TP=-1.5:LRA=11,"
+            "alimiter=level_in=1:level_out=1:limit=0.95:release=50"
+        ),
+    ),
+    "production": AudioProfile(
+        name="production",
+        filter_chain=(
+            "highpass=f=80,"
+            "anlmdn=s=7:p=0.002:m=15,"
+            "dialoguenhance,"
+            "loudnorm=I=-16:TP=-1.5:LRA=11,"
+            "alimiter=level_in=1:level_out=1:limit=0.95:release=50"
+        ),
+    ),
 }
 
 SCHEDULER_PROFILES: Dict[str, SchedulerProfile] = {
@@ -189,6 +233,7 @@ SCHEDULER_PROFILES: Dict[str, SchedulerProfile] = {
         cpuset_ffmpeg="8-15,24-31",
         cpuset_audio="8-15,24-31",
         cpuset_python="0-7,16-23",
+        rife_threads="2:8:4",
     ),
     # T9: Production profile — CCD split + ionice/chrt + tuned chunk size.
     # Use with ENHANCE_NVENC_GPUS=0,1 for dual-NVENC encoding.
@@ -200,7 +245,8 @@ SCHEDULER_PROFILES: Dict[str, SchedulerProfile] = {
         ionice_class=2,
         ionice_level=0,
         use_chrt=True,
-        chunk_seconds=15,
+        chunk_seconds=20,
+        rife_threads="1:8:4",
     ),
 }
 

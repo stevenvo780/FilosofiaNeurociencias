@@ -33,8 +33,8 @@ def main():
                     help="Skip audio enhancement and mux original audio when available")
     ap.add_argument("--audio-input", type=str, default=None,
                     help="Optional external audio source to enhance/mux")
-    ap.add_argument("--chunk", type=int, default=C.CHUNK_SECONDS,
-                    help=f"Chunk duration seconds (default {C.CHUNK_SECONDS})")
+    ap.add_argument("--chunk", type=int, default=None,
+                    help="Chunk duration seconds (default: scheduler profile or config)")
     ap.add_argument("--start", type=float, default=0.0,
                     help="Start offset in seconds for test slices")
     ap.add_argument("--duration", type=float, default=None,
@@ -51,6 +51,8 @@ def main():
                     help="CPU scheduler profile (baseline, split_l3_a, split_l3_b)")
     ap.add_argument("--rife-backend", type=str, default=None,
                     help="RIFE backend (baseline, torch)")
+    ap.add_argument("--rife-threads", type=str, default=None,
+                    help="Override RIFE thread tuple load:proc:save (e.g. 1:8:4)")
     ap.add_argument("--models-dir", type=str, default=None,
                     help="Directory for model weights")
     ap.add_argument("--benchmark-tag", type=str, default=None,
@@ -74,9 +76,23 @@ def main():
     )
     apply_scheduler_profile(sp)
 
+    effective_chunk = args.chunk if args.chunk is not None else sp.chunk_seconds or C.CHUNK_SECONDS
+    effective_rife_threads = args.rife_threads or os.environ.get("ENHANCE_RIFE_THREADS") or sp.rife_threads or C.RIFE_THREADS
+
     # Override config from profiles where applicable
+    C.CHUNK_SECONDS = effective_chunk
+    C.RIFE_THREADS = effective_rife_threads
+    C.RIFE_GPU = rp.gpu
+    C.RIFE_STREAM_WINDOW = rp.stream_window
+    C.RIFE_MIN_WINDOW = rp.min_window
+    C.RIFE_POLL_SECONDS = rp.poll_seconds
+    C.RIFE_FILE_SETTLE_SECONDS = rp.file_settle_seconds
+    C.RIFE_CLEANUP_MODE = rp.cleanup_mode
+    os.environ["ENHANCE_CHUNK_SECONDS"] = str(effective_chunk)
+    os.environ["ENHANCE_RIFE_THREADS"] = effective_rife_threads
     if args.models_dir:
         os.environ["ENHANCE_MODELS_DIR"] = args.models_dir
+        C.MODELS_DIR = args.models_dir
 
     src = Path(args.input).resolve()
     if not src.exists():
@@ -105,7 +121,7 @@ def main():
     if start_at > 0 or args.duration is not None:
         slice_tag = f"_s{int(start_at)}_d{int(process_dur)}"
 
-    work = out_dir / f"work_{src.stem}_{args.chunk}s{slice_tag}"
+    work = out_dir / f"work_{src.stem}_{effective_chunk}s{slice_tag}"
     if args.clean and work.exists():
         shutil.rmtree(work)
     work.mkdir(exist_ok=True)
@@ -142,11 +158,12 @@ def main():
     print(f"  Input:  {src.name}  ({full_dur/3600:.1f}h total, {w}x{h} @ {fps}fps)")
     print(f"  Output: {dst.name}  ({w*scale}x{h*scale} @ {out_fps}fps)")
     print(f"  Slice:  {start_at:.1f}s → {start_at + process_dur:.1f}s  ({process_dur/60:.1f} min)")
-    print(f"  Frames: ~{total_frames:,}  |  Chunks: {args.chunk}s each")
+    print(f"  Frames: ~{total_frames:,}  |  Chunks: {effective_chunk}s each")
     print(f"  ESRGAN: {'ON' if do_esr else 'SKIP'}  |  RIFE: {'ON' if do_rife else 'SKIP'}")
     print(f"  Audio:  {'ENHANCE' if (audio_src and not args.skip_audio) else ('COPY' if audio_src else 'NONE')}")
     print(f"  Tmpfs:  {C.TMPFS_WORK}  (PNG intermedios en tmpfs + ventanas en RAM)")
     print(f"  Profiles: visual={vp.name} audio={aup.name} sched={sp.name} rife={rp.name}")
+    print(f"  RIFE threads: {C.RIFE_THREADS}  |  cleanup={C.RIFE_CLEANUP_MODE}  |  window={C.RIFE_STREAM_WINDOW}/{C.RIFE_MIN_WINDOW}")
     print("=" * 60)
 
     prog = Progress(work)
@@ -156,7 +173,7 @@ def main():
     end_at = start_at + process_dur
     min_chunk = 0.5 / max(fps, 1.0)
     while s < end_at - 1e-6:
-        cd = min(args.chunk, end_at - s)
+        cd = min(effective_chunk, end_at - s)
         if cd <= 0 or cd < min_chunk:
             break
         chunks.append((i, s, cd))

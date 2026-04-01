@@ -277,9 +277,14 @@ El sistema de perfiles (`enhance/profiles.py`) permite configurar cuatro ejes de
 | Perfil | Modelo | Downscale | Hybrid Detail | Face Adaptive |
 |---|---|---|---|---|
 | `baseline` | anime_baseline | 0.5× | 0.0 | No |
-| `quality` | realesrgan_x2plus | 1.0× | 0.15 | Sí |
 | `fast` | anime_baseline | 0.5× | 0.0 | No |
+| `real_x2` / `real_x2plus` | realesrgan_x2plus | 1.0× | 0.0 | No |
+| `real_x4plus` | realesrgan_x4plus | 0.5× | 0.08 | No |
+| `hybrid_detail` | realesrgan_x4plus | 0.5× | 0.12 | No |
+| `face_adaptive` | realesrgan_x2plus | 1.0× | 0.2 | Sí |
+| `quality` | realesrgan_x2plus | 1.0× | 0.15 | Sí |
 | `face_preserve` | realesrgan_x2plus | 1.0× | 0.25 | Sí |
+| `production` | realesrgan_x2plus | 1.0× | 0.15 | Sí |
 
 ### Audio Profiles
 
@@ -289,6 +294,7 @@ El sistema de perfiles (`enhance/profiles.py`) permite configurar cuatro ejes de
 | `conservative` | anlmdn + loudnorm + alimiter |
 | `voice` | anlmdn + dialoguenhance + speechnorm + alimiter |
 | `natural` | afftdn + loudnorm + alimiter |
+| `voice_natural` / `lecture_natural` / `production` | highpass + anlmdn + dialoguenhance + loudnorm + alimiter |
 
 ### Scheduler Profiles
 
@@ -297,6 +303,7 @@ El sistema de perfiles (`enhance/profiles.py`) permite configurar cuatro ejes de
 | `baseline` | Sin afinidad |
 | `split_l3_a` | CCD0 para extract/audio, CCD1 para coordinación |
 | `split_l3_b` | Inverso |
+| `production` | CCD split + ionice + chrt para producción |
 
 ### RIFE Backends
 

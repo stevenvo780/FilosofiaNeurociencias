@@ -14,6 +14,10 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from enhance import config as C
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -152,7 +156,10 @@ class MonitorSet:
             stderr=subprocess.DEVNULL,
         ))
         # GPU CSV loop
-        gpu_header = "timestamp,index,gpu_util,mem_util,mem_used,mem_total,temp,power,pcie_tx,pcie_rx"
+        gpu_header = (
+            "timestamp,index,gpu_util,mem_util,mem_used,mem_total,"
+            "temp,power,pcie_gen_current,pcie_width_current"
+        )
         gpu_query = (
             "timestamp,index,utilization.gpu,utilization.memory,"
             "memory.used,memory.total,temperature.gpu,power.draw,"
@@ -187,12 +194,18 @@ class MonitorSet:
 def build_run_cmd(args) -> list[str]:
     """Build the scripts/run.py command list."""
     cmd = [
-        sys.executable, str(ROOT / "scripts" / "run.py"),
+        sys.executable, "-u", str(ROOT / "scripts" / "run.py"),
         str(args.input),
         "--start", str(args.start),
         "--duration", str(args.duration),
-        "--chunk", "15",
+        "--chunk", str(args.chunk_seconds),
     ]
+    if args.skip_esrgan:
+        cmd.append("--skip-esrgan")
+    if args.skip_rife:
+        cmd.append("--skip-rife")
+    if args.skip_audio:
+        cmd.append("--skip-audio")
     if args.outdir:
         cmd += ["--outdir", args.outdir]
     # Forward profile arguments to run.py
@@ -212,12 +225,26 @@ def parse_args():
         description="Benchmark runner — wraps run.py with full system instrumentation.",
     )
     ap.add_argument("input", help="Input video file")
+    ap.add_argument("--skip-esrgan", action="store_true",
+                    help="Forward --skip-esrgan to run.py")
+    ap.add_argument("--skip-rife", action="store_true",
+                    help="Forward --skip-rife to run.py")
+    ap.add_argument("--skip-audio", action="store_true",
+                    help="Forward --skip-audio to run.py")
     ap.add_argument("--start", type=float, default=60.0,
                     help="Start offset in seconds (default: 60)")
     ap.add_argument("--duration", type=float, default=60.0,
                     help="Duration in seconds (default: 60)")
     ap.add_argument("--tag", type=str, default="",
                     help="Benchmark tag for identification")
+    ap.add_argument("--chunk-seconds", type=int, default=None,
+                    help="Chunk duration in seconds (default: config default)")
+    ap.add_argument("--chunk-sweep", type=str, default=None,
+                    help="Comma-separated chunk sizes to sweep, e.g. 15,20,30")
+    ap.add_argument("--rife-threads", type=str, default=None,
+                    help="Override ENHANCE_RIFE_THREADS for the run")
+    ap.add_argument("--rife-threads-sweep", type=str, default=None,
+                    help="Comma-separated RIFE thread configs to sweep, e.g. 1:4:4,1:8:4")
     ap.add_argument("--outdir", type=str, default="/tmp",
                     help="Base output directory (default: /tmp)")
     ap.add_argument("--visual-profile", type=str, default="baseline",
@@ -260,11 +287,22 @@ def _try_perf_stat(pid: int, bench_dir: Path):
         pass
 
 
-def main():
-    args = parse_args()
+def _parse_csv_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
+
+def _sanitize_token(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.:-]+", "_", value)
+
+
+def _run_benchmark(args, *, chunk_seconds: int, rife_threads: str | None):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tag = args.tag or "run"
+    tag_parts = [args.tag or "run", f"chunk{chunk_seconds}"]
+    if rife_threads:
+        tag_parts.append(f"rife_{_sanitize_token(rife_threads)}")
+    tag = "_".join(tag_parts)
     bench_dir = ROOT / "enhanced" / "logs" / f"bench_{tag}_{stamp}"
     bench_dir.mkdir(parents=True, exist_ok=True)
 
@@ -273,15 +311,12 @@ def main():
     print(f"  Output: {bench_dir}")
     print(f"{'=' * 64}\n")
 
-    # Step 1 — Kill orphans
     print("[bench] Killing orphan processes …")
     _kill_orphans()
 
-    # Step 2 — Clean tmpfs
     print("[bench] Cleaning /tmp/enhance_work …")
     _clean_tmpfs()
 
-    # Step 3 — Hardware snapshot
     print("[bench] Capturing hardware info …")
     hw = capture_hardware(bench_dir)
     for i, g in enumerate(hw.get("gpus", [])):
@@ -289,7 +324,6 @@ def main():
         print(f"  GPU{i}: {g['name']}  mem={g['memory_total']}  "
               f"PCIe gen{g['pcie_gen_current']} x{g['pcie_width_current']}{pcie_note}")
 
-    # Step 4 — Set environment from profiles
     env_vars = {
         "ENHANCE_VISUAL_PROFILE": args.visual_profile,
         "ENHANCE_AUDIO_PROFILE": args.audio_profile,
@@ -299,12 +333,16 @@ def main():
     }
     if args.models_dir:
         env_vars["ENHANCE_MODELS_DIR"] = args.models_dir
+    if rife_threads:
+        env_vars["ENHANCE_RIFE_THREADS"] = rife_threads
+    env_vars["ENHANCE_CHUNK_SECONDS"] = str(chunk_seconds)
     for k, v in env_vars.items():
         os.environ[k] = v
     print(f"[bench] Environment: {json.dumps(env_vars, indent=2)}")
 
-    # Step 5 — Build command
-    cmd = build_run_cmd(args)
+    from argparse import Namespace
+    cmd_args = Namespace(**{**vars(args), "chunk_seconds": chunk_seconds})
+    cmd = build_run_cmd(cmd_args)
     if args.nsys:
         nsys_out = str(bench_dir / "nsys_report")
         cmd = ["nsys", "profile", "--output", nsys_out, "--force-overwrite", "true"] + cmd
@@ -312,12 +350,10 @@ def main():
     cmd_str = " ".join(str(c) for c in cmd)
     print(f"[bench] Command: {cmd_str}\n")
 
-    # Step 6 — Start monitors
     monitors = MonitorSet(bench_dir)
     monitors.start()
     print("[bench] Monitors started (mpstat, iostat, memory, gpu)")
 
-    # Step 7 — Run pipeline
     t0 = time.time()
     pipeline_log = bench_dir / "pipeline.log"
     with open(pipeline_log, "w") as log_f:
@@ -328,7 +364,6 @@ def main():
             env=os.environ.copy(),
         )
 
-        # Optionally attach perf stat in background
         perf_thread = None
         if not args.throughput_only and proc.pid:
             import threading
@@ -337,7 +372,6 @@ def main():
             )
             perf_thread.start()
 
-        # Stream output to both stdout and log file
         for line in proc.stdout:
             sys.stdout.write(line)
             log_f.write(line)
@@ -345,12 +379,9 @@ def main():
 
     wall_time = time.time() - t0
     exit_code = proc.returncode
-
-    # Step 8 — Stop monitors
     monitors.stop()
     print(f"\n[bench] Pipeline finished in {wall_time:.1f}s  (exit={exit_code})")
 
-    # Step 9 — Collect chunk_metrics.jsonl
     work_dir = _find_work_dir(args.outdir)
     metrics_copied = False
     if work_dir:
@@ -360,19 +391,19 @@ def main():
             metrics_copied = True
             print(f"[bench] Copied chunk_metrics.jsonl ({jsonl_src.stat().st_size} bytes)")
 
-    # Step 10 — Summary
     print(f"\n{'=' * 64}")
     print(f"  BENCHMARK SUMMARY — {tag}")
     print(f"{'=' * 64}")
     print(f"  Wall time:       {wall_time:.1f}s  ({wall_time / 60:.2f} min)")
-
     process_dur = args.duration
     throughput_ratio = process_dur / wall_time if wall_time > 0 else 0.0
     print(f"  Throughput:      {throughput_ratio:.3f}x realtime")
 
-    # Estimate full video duration if we have it
     try:
-        r = _run(f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {args.input}")
+        r = _run(
+            f"ffprobe -v error -show_entries format=duration "
+            f"-of default=noprint_wrappers=1:nokey=1 {args.input}"
+        )
         full_dur = float(r.stdout.strip())
         eta_seconds = full_dur / throughput_ratio if throughput_ratio > 0 else float("inf")
         print(f"  Full video:      {full_dur:.0f}s  ({full_dur / 3600:.1f}h)")
@@ -385,7 +416,6 @@ def main():
     print(f"  Logs:            {bench_dir}")
     print(f"{'=' * 64}\n")
 
-    # Save summary JSON
     summary = {
         "tag": tag,
         "stamp": stamp,
@@ -395,6 +425,8 @@ def main():
         "exit_code": exit_code,
         "pcie_blocked": hw.get("pcie_blocked", False),
         "metrics_collected": metrics_copied,
+        "chunk_seconds": chunk_seconds,
+        "rife_threads": rife_threads,
         "profiles": {
             "visual": args.visual_profile,
             "audio": args.audio_profile,
@@ -403,6 +435,21 @@ def main():
         },
     }
     (bench_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    return exit_code
+
+
+def main():
+    args = parse_args()
+    chunk_values = [args.chunk_seconds] if args.chunk_seconds is not None else []
+    chunk_values = chunk_values or [int(v) for v in _parse_csv_list(args.chunk_sweep)] or [C.CHUNK_SECONDS]
+    rife_values = [args.rife_threads] if args.rife_threads is not None else []
+    rife_values = rife_values or _parse_csv_list(args.rife_threads_sweep) or [None]
+
+    exit_code = 0
+    for chunk_seconds in chunk_values:
+        for rife_threads in rife_values:
+            rc = _run_benchmark(args, chunk_seconds=chunk_seconds, rife_threads=rife_threads)
+            exit_code = exit_code or rc
 
     sys.exit(exit_code)
 
