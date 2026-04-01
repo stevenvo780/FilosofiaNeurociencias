@@ -184,6 +184,7 @@ Toda la configuración se controla via variables de entorno en `enhance/config.p
 | `ENHANCE_RIFE_TORCH_MODEL_FILE` | `""` | Ruta directa a `flownet.pkl` para backend torch |
 | `ENHANCE_RIFE_TORCH_MODEL_DIR` | `""` | Directorio que contiene `flownet.pkl` para backend torch |
 | `ENHANCE_RIFE_TORCH_THREADS` | `0` | Hilos CPU para backend torch (`0` = default de PyTorch) |
+| `ENHANCE_RIFE_TORCH_BATCH` | `2` | Número de parejas consecutivas por inferencia en `RIFE` torch |
 | `ENHANCE_RIFE_ALLOW_BLEND_FALLBACK` | `0` | Solo para depuración si falla la carga del modelo torch |
 | `ENHANCE_PIPELINE_DEPTH` | `2` | Profundidad del pipeline de chunks |
 | `ENHANCE_MAX_EXTRACT_BYTES_IN_FLIGHT` | `6 GiB` | Budget de extracción en vuelo |

@@ -388,9 +388,24 @@ class OfficialRIFEInterpolator:
         self.model = model
 
     def interpolate(self, frame0: np.ndarray, frame1: np.ndarray) -> np.ndarray:
-        h, w = frame0.shape[:2]
-        t0 = self._frame_to_tensor(frame0)
-        t1 = self._frame_to_tensor(frame1)
+        return self.interpolate_many([frame0], [frame1])[0]
+
+    def interpolate_many(
+        self,
+        frames0: list[np.ndarray],
+        frames1: list[np.ndarray],
+    ) -> list[np.ndarray]:
+        if len(frames0) != len(frames1):
+            raise ValueError("frames0 and frames1 must have the same length")
+        if not frames0:
+            return []
+
+        h, w = frames0[0].shape[:2]
+        if any(f.shape[:2] != (h, w) for f in frames0 + frames1):
+            raise ValueError("All frames in a batch must have the same spatial shape")
+
+        t0 = torch.cat([self._frame_to_tensor(frame) for frame in frames0], dim=0)
+        t1 = torch.cat([self._frame_to_tensor(frame) for frame in frames1], dim=0)
 
         ph = ((h - 1) // 32 + 1) * 32
         pw = ((w - 1) // 32 + 1) * 32
@@ -404,15 +419,14 @@ class OfficialRIFEInterpolator:
 
         merged = merged[:, :, :h, :w]
         out = (
-            merged[0]
-            .clamp(0, 1)
+            merged.clamp(0, 1)
             .mul(255.0)
             .byte()
-            .permute(1, 2, 0)
+            .permute(0, 2, 3, 1)
             .cpu()
             .numpy()
         )
-        return out
+        return [frame for frame in out]
 
     def _frame_to_tensor(self, frame: np.ndarray) -> torch.Tensor:
         arr = np.ascontiguousarray(frame)

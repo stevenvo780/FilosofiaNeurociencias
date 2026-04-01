@@ -204,6 +204,7 @@ class TorchBackend(RIFEBackend):
         self._model_file = model_file
         self._model_dir = model_dir
         self._cpu_threads = cpu_threads
+        self._batch_size = C.RIFE_TORCH_BATCH
 
         # Timing metrics
         self._spawn_t: float = 0.0
@@ -297,26 +298,33 @@ class TorchBackend(RIFEBackend):
         t1 = time.monotonic()
 
         out_idx = 1
+        next_pos = 1
         with torch.inference_mode():
-            for path in png_paths[1:]:
+            while next_pos < len(png_paths):
                 if C.shutdown.is_set():
                     handle._returncode = -1
                     return
 
-                curr = _read_rgb(path)
-                if curr is None:
-                    handle._returncode = 1
-                    return
+                batch_frames = [prev]
+                while len(batch_frames) < self._batch_size + 1 and next_pos < len(png_paths):
+                    curr = _read_rgb(png_paths[next_pos])
+                    next_pos += 1
+                    if curr is None:
+                        handle._returncode = 1
+                        return
+                    batch_frames.append(curr)
 
-                dst = out_dir / f"{out_idx:08d}.png"
-                cv2.imwrite(str(dst), cv2.cvtColor(prev, cv2.COLOR_RGB2BGR))
-                out_idx += 1
+                mids = self._model.interpolate_many(batch_frames[:-1], batch_frames[1:])
+                for idx, mid in enumerate(mids):
+                    dst = out_dir / f"{out_idx:08d}.png"
+                    cv2.imwrite(str(dst), cv2.cvtColor(batch_frames[idx], cv2.COLOR_RGB2BGR))
+                    out_idx += 1
 
-                mid = self._model.interpolate(prev, curr)
-                dst = out_dir / f"{out_idx:08d}.png"
-                cv2.imwrite(str(dst), cv2.cvtColor(mid, cv2.COLOR_RGB2BGR))
-                out_idx += 1
-                prev = curr
+                    dst = out_dir / f"{out_idx:08d}.png"
+                    cv2.imwrite(str(dst), cv2.cvtColor(mid, cv2.COLOR_RGB2BGR))
+                    out_idx += 1
+
+                prev = batch_frames[-1]
 
             # Match ncnn's exact 2x frame count by duplicating the final frame.
             for _ in range(2):
