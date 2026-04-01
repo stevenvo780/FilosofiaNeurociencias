@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -199,6 +200,7 @@ class TorchBackend(RIFEBackend):
         self._gpu = gpu
         self._model_name = model_name
         self._model: Any = None
+        self._model_lock = threading.Lock()
         requested = (device or f"cuda:{gpu}").strip().lower()
         self._device: str = "cpu" if requested == "cpu" else f"cuda:{gpu}"
         self._model_file = model_file
@@ -206,7 +208,7 @@ class TorchBackend(RIFEBackend):
         self._cpu_threads = cpu_threads
         self._batch_size = C.RIFE_TORCH_BATCH
 
-        # Timing metrics
+        # Timing metrics (per-call, not thread-safe — only for last call)
         self._spawn_t: float = 0.0
         self._compute_t: float = 0.0
         self._drain_t: float = 0.0
@@ -214,25 +216,33 @@ class TorchBackend(RIFEBackend):
         self._running_t0: float | None = None
 
     def _ensure_model(self) -> None:
-        """Load real IFNet weights, with opt-in blend fallback for experiments."""
+        """Load real IFNet weights (thread-safe, loads once)."""
         if self._model is not None:
             return
-
-        try:
-            checkpoint = ensure_torch_rife_checkpoint(
-                model_name=self._model_name,
-                model_file=self._model_file or C.RIFE_TORCH_MODEL_FILE or None,
-                model_dir=self._model_dir or C.RIFE_TORCH_MODEL_DIR or None,
-            )
-            self._model = OfficialRIFEInterpolator(
-                checkpoint=checkpoint,
-                device=self._device,
-                cpu_threads=self._cpu_threads or C.RIFE_TORCH_THREADS,
-            )
-        except Exception:
-            if not C.RIFE_ALLOW_BLEND_FALLBACK:
-                raise
-            self._model = _BlendInterpolator(self._device)
+        with self._model_lock:
+            if self._model is not None:
+                return
+            effective_threads = self._cpu_threads or C.RIFE_CPU_THREADS_PER_WORKER or C.RIFE_TORCH_THREADS
+            try:
+                checkpoint = ensure_torch_rife_checkpoint(
+                    model_name=self._model_name,
+                    model_file=self._model_file or C.RIFE_TORCH_MODEL_FILE or None,
+                    model_dir=self._model_dir or C.RIFE_TORCH_MODEL_DIR or None,
+                )
+                self._model = OfficialRIFEInterpolator(
+                    checkpoint=checkpoint,
+                    device=self._device,
+                    cpu_threads=effective_threads,
+                )
+                print(
+                    f"  [RIFE torch] Model loaded on {self._device} "
+                    f"(threads_per_worker={effective_threads})",
+                    flush=True,
+                )
+            except Exception:
+                if not C.RIFE_ALLOW_BLEND_FALLBACK:
+                    raise
+                self._model = _BlendInterpolator(self._device)
 
     # -- ABC implementation ------------------------------------------------
 
@@ -243,17 +253,20 @@ class TorchBackend(RIFEBackend):
         return max(n_input, 0) * 2
 
     def start_interpolate(self, in_dir: Path, out_dir: Path) -> Any:
-        """Synchronously interpolate in-memory, write results as PNGs.
+        """Launch interpolation in a background thread.
+
+        Thread-safe: multiple concurrent calls are supported. The model
+        is loaded once and shared across all worker threads (read-only
+        inference is safe under torch.inference_mode).
 
         Returns a _TorchHandle that mimics Popen for compatibility with
         the polling-based pipeline.
         """
-        import threading as _th
         self._ensure_model()
         self._reset_metrics()
 
         handle = _TorchHandle()
-        thread = _th.Thread(
+        thread = threading.Thread(
             target=self._interpolate_worker,
             args=(in_dir, out_dir, handle),
             daemon=True,
@@ -429,7 +442,7 @@ def create_backend(profile: RIFEBackendProfile | None = None) -> RIFEBackend:
     """
     backend_name = getattr(profile, "backend", "ncnn") if profile is not None else "ncnn"
 
-    effective_gpu = int(os.getenv("ENHANCE_RIFE_GPU", str(getattr(profile, "gpu", C.RIFE_GPU) if profile is not None else C.RIFE_GPU)))
+    effective_gpu = os.getenv("ENHANCE_RIFE_GPU", str(getattr(profile, "gpu", C.RIFE_GPU) if profile is not None else C.RIFE_GPU))
 
     if backend_name == "torch":
         gpu = effective_gpu

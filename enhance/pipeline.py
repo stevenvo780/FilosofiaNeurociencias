@@ -465,9 +465,7 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
                                  w: int, h: int,
                                  budget: _BudgetController | None = None,
                                  metrics: _MetricsStore | None = None,
-                                 prefetched: dict | None = None,
-                                 next_item_watch: dict | None = None,
-                                 next_prefetch_start=None) -> tuple[dict[str, float], dict | None]:
+                                 prefetched: dict | None = None) -> dict[str, float]:
     """Run RIFE asynchronously and feed ready windows into ESRGAN/NVENC."""
     def _empty_stream_stats() -> dict[str, float]:
         return {
@@ -528,50 +526,6 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
     rife_ready_peak = 0
     extract_peak = 0
     esr_stats: dict[str, float] = {}
-    next_prefetch: dict | None = None
-    next_prefetch_error: BaseException | None = None
-    next_prefetch_ready = threading.Event()
-    next_prefetch_cancel = threading.Event()
-
-    def _watch_rife_and_prefetch():
-        nonlocal next_prefetch, next_prefetch_error
-        if next_item_watch is None or next_prefetch_start is None:
-            next_prefetch_ready.set()
-            return
-
-        def runner():
-            nonlocal next_prefetch, next_prefetch_error
-            try:
-                while not C.shutdown.is_set() and not next_prefetch_cancel.is_set():
-                    rc = rife_backend.poll(rife_handle)
-                    if rc is not None:
-                        if rc != 0:
-                            return
-                        break
-                    time.sleep(C.RIFE_POLL_SECONDS)
-
-                while not C.shutdown.is_set() and not next_prefetch_cancel.is_set():
-                    if next_item_watch["ready"].wait(timeout=C.RIFE_POLL_SECONDS):
-                        break
-
-                if C.shutdown.is_set() or next_prefetch_cancel.is_set():
-                    return
-                if next_item_watch["error"] is not None:
-                    raise RuntimeError("Next-chunk RIFE prefetch failed") from next_item_watch["error"]
-
-                next_prefetch = next_prefetch_start(next_item_watch["item"])
-            except BaseException as exc:
-                next_prefetch_error = exc
-            finally:
-                next_prefetch_ready.set()
-
-        threading.Thread(
-            target=runner,
-            daemon=True,
-            name=f"RIFE Prefetch Watch {cid:04d}",
-        ).start()
-
-    _watch_rife_and_prefetch()
 
     try:
         while next_idx < expected:
@@ -700,13 +654,6 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
         nvenc.wait()
         encode_tail_dt = time.time() - t_tail
     except Exception:
-        next_prefetch_cancel.set()
-        if next_prefetch is not None:
-            backend = next_prefetch["backend"]
-            with suppress(Exception):
-                backend.terminate(next_prefetch["handle"])
-            with suppress(Exception):
-                backend.wait(next_prefetch["handle"], timeout=5)
         with suppress(Exception):
             rife_backend.terminate(rife_handle)
         with suppress(Exception):
@@ -723,12 +670,6 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
             budget.clear_rife_ready(cid)
             budget.release_extract(cid)
         _cleanup_chunk_dir(rife_in.parent)
-
-    if not next_prefetch_ready.is_set():
-        next_prefetch_cancel.set()
-        next_prefetch_ready.wait(timeout=max(C.RIFE_POLL_SECONDS * 4, 0.2))
-    if next_prefetch_error is not None:
-        raise RuntimeError("Next-chunk RIFE prefetch failed") from next_prefetch_error
 
     if nvenc.returncode != 0 and not C.shutdown.is_set():
         raise RuntimeError(f"NVENC streaming encode failed (rc={nvenc.returncode})")
@@ -752,7 +693,7 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
         stats[f"esrgan_{key}_seconds"] = value
     if metrics is not None:
         metrics.update(cid, **stats)
-    return stats, next_prefetch
+    return stats
 
 
 def _write_pngs(frames: list[np.ndarray], out_dir: Path):
@@ -844,17 +785,39 @@ def extract_worker(chunks, src: Path, w: int, h: int, fps: float,
     out_q.put(None)
 
 
-def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
-                      in_q: queue.Queue, out_q: queue.Queue,
-                      rife_backend_profile,
-                      budget: _BudgetController | None,
-                      metrics: _MetricsStore | None,
-                      w: int, h: int):
-    """Stage 2 (NEW ORDER): RIFE interpolation at ORIGINAL resolution (1260p, 3.8x faster than 4K).
-    
-    Receives raw extracted frames, writes them as PNGs, runs RIFE Vulkan, 
-    reads interpolated frames back into RAM, and passes downstream to ESRGAN.
+def rife_dispatcher_worker(do_rife: bool, do_esr: bool, fps: float, prog: Progress,
+                           in_q: queue.Queue, out_q: queue.Queue,
+                           rife_backend_profile,
+                           budget: _BudgetController | None,
+                           metrics: _MetricsStore | None,
+                           w: int, h: int):
+    """Stage 2: RIFE dispatcher. Dispatches RIFE tasks using a SINGLE cached
+    backend instance so the model is loaded once and shared across all
+    concurrent interpolation threads.
+
+    For torch_cpu backends, this means multiple threads share the same IFNet
+    model and PyTorch distributes work across cpu_threads_per_worker threads
+    per inference call.  Since PyTorch releases the GIL during compute,
+    multiple concurrent interpolations achieve true CPU parallelism.
     """
+    # Create ONE backend and reuse it for all chunks — critical for:
+    # 1. Avoiding repeated model loads (~200MB each)
+    # 2. Sharing the model across concurrent torch threads
+    rife_backend = create_backend(rife_backend_profile)
+    backend_name = rife_backend.name()
+
+    # For torch CPU backends, set thread count once at dispatcher start
+    if backend_name == "torch":
+        import torch
+        per_worker = C.RIFE_CPU_THREADS_PER_WORKER
+        if per_worker > 0:
+            torch.set_num_threads(per_worker)
+            print(
+                f"  [RIFE dispatcher] torch threads_per_worker={per_worker} "
+                f"(workers={C.RIFE_WORKERS}, total_threads={per_worker * C.RIFE_WORKERS})",
+                flush=True,
+            )
+
     while True:
         item = in_q.get()
         if item is None:
@@ -863,18 +826,16 @@ def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
         if C.shutdown.is_set():
             out_q.put(None)
             break
-            
+
         cid, frames, raw_dir = item
         if frames is None and raw_dir is None:
-            out_q.put((cid, None))
+            out_q.put((cid, None, None))
             continue
 
         if not do_rife:
-            # Pass through — no interpolation
-            out_q.put((cid, frames))
+            out_q.put((cid, frames, None))
             continue
 
-        rife_backend = create_backend(rife_backend_profile)
         rife_in = raw_dir if raw_dir is not None else (_tmpfs_chunk(cid) / "raw")
         rife_out = _tmpfs_chunk(cid) / "rife"
         shutil.rmtree(rife_out, ignore_errors=True)
@@ -891,6 +852,22 @@ def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
                 flush=True,
             )
 
+        if do_esr:
+            # Async dispatch — reuse the cached backend
+            handle = rife_backend.start_interpolate(rife_in, rife_out)
+            prefetched = {
+                "backend": rife_backend,
+                "cid": cid,
+                "handle": handle,
+                "out_dir": rife_out,
+                "started_at": time.time(),
+                "raw_dir": rife_in
+            }
+            print(f"  [RIFE] Started chunk {cid:04d} asynchronously ({backend_name})", flush=True)
+            out_q.put((cid, None, prefetched))
+            continue
+
+        # Synchronous fallback (do_rife=True, do_esr=False)
         tr = time.time()
         n = rife_backend.interpolate_sync(rife_in, rife_out)
         prog.mark(cid, "rife")
@@ -907,7 +884,7 @@ def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
         if C.RIFE_CLEANUP_MODE != "none":
             shutil.rmtree(rife_in, ignore_errors=True)
 
-        # Read interpolated frames back into RAM for ESRGAN
+        # Read interpolated frames back into RAM
         from concurrent.futures import ThreadPoolExecutor
         png_files = [rife_out / f"{i:08d}.png" for i in range(1, _count_numbered_pngs(rife_out) + 1)]
         
@@ -934,12 +911,11 @@ def rife_first_worker(do_rife: bool, fps: float, prog: Progress,
                 flush=True,
             )
         
-        # Cleanup RIFE tmpfs
         if budget is not None:
             budget.release_extract(cid)
         _cleanup_chunk_dir(_tmpfs_chunk(cid))
         
-        out_q.put((cid, interp_frames))
+        out_q.put((cid, interp_frames, None))
 
 
 def _report_progress(total: int, done_n: int, counter: list[int],
@@ -969,107 +945,19 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
     current chunk.  Since RIFE runs on GPU1 via Vulkan and ESRGAN uses GPU0
     via CUDA, they execute truly in parallel on different GPUs.
     """
-    no_item = object()
-    carried_item = no_item
-    prefetched: dict | None = None
-    probe_backend = create_backend(rife_backend_profile) if do_rife else None
-    rife_prefetch_safe = (
-        esr is not None
-        and (
-            probe_backend is None
-            or not probe_backend.uses_dedicated_gpu()
-            or C.RIFE_GPU not in set(esr.gpu_ids)
-        )
-    )
-
-    def _start_rife_prefetch(cid_pf: int, raw_dir_pf: Path) -> dict:
-        """Start RIFE for the next chunk before the current ESRGAN begins."""
-        backend = create_backend(rife_backend_profile)
-        rife_out_pf = raw_dir_pf.parent / "rife"
-        shutil.rmtree(rife_out_pf, ignore_errors=True)
-        handle = backend.start_interpolate(raw_dir_pf, rife_out_pf)
-        print(f"    Prefetch RIFE chunk {cid_pf:04d}: started", flush=True)
-        return {
-            "backend": backend,
-            "cid": cid_pf,
-            "handle": handle,
-            "out_dir": rife_out_pf,
-            "started_at": time.time(),
-        }
-
-    def _prefetch_item(item) -> dict | None:
-        if item is None:
-            return None
-        if len(item) == 3:
-            next_cid, _, next_raw = item
-        else:
-            next_cid, next_raw = item[0], None
-
-        if (
-            next_raw is not None
-            and next_cid is not None
-            and not prog.done(next_cid, "encode")
-        ):
-            return _start_rife_prefetch(next_cid, next_raw)
-        return None
-
-    def _spawn_next_item_watch() -> dict:
-        """Wait for the next extracted chunk metadata while current work runs."""
-        state = {
-            "item": no_item,
-            "error": None,
-            "ready": threading.Event(),
-        }
-
-        def runner():
-            try:
-                item = in_q.get()
-                state["item"] = item
-                if item is None or C.shutdown.is_set():
-                    return
-            except BaseException as exc:
-                state["error"] = exc
-            finally:
-                state["ready"].set()
-
-        threading.Thread(
-            target=runner,
-            daemon=True,
-            name="RIFE Prefetch",
-        ).start()
-        return state
-
     while True:
-        if carried_item is not no_item:
-            item = carried_item
-            carried_item = no_item
-        else:
-            item = in_q.get()
-        if item is None:
-            if prefetched is not None:
-                backend = prefetched["backend"]
-                with suppress(Exception):
-                    backend.terminate(prefetched["handle"])
-                with suppress(Exception):
-                    backend.wait(prefetched["handle"], timeout=5)
-            for _ in C.NVENC_GPUS:
-                out_q.put(None)
-            break
-        if C.shutdown.is_set():
-            if prefetched is not None:
-                backend = prefetched["backend"]
-                with suppress(Exception):
-                    backend.terminate(prefetched["handle"])
-                with suppress(Exception):
-                    backend.wait(prefetched["handle"], timeout=5)
+        item = in_q.get()
+        if item is None or C.shutdown.is_set():
             for _ in C.NVENC_GPUS:
                 out_q.put(None)
             break
 
         if len(item) == 3:
-            cid, frames, raw_dir = item
+            cid, frames, prefetched = item
+            raw_dir = prefetched.get("raw_dir") if prefetched else None
         else:
             cid, frames = item
+            prefetched = None
             raw_dir = None
 
         if prog.done(cid, "encode"):
@@ -1091,25 +979,9 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                 _count_numbered_pngs(raw_dir)
             )
 
-            current_prefetch = None
-            if prefetched is not None:
-                if prefetched["cid"] == cid:
-                    current_prefetch = prefetched
-                else:
-                    backend = prefetched["backend"]
-                    with suppress(Exception):
-                        backend.terminate(prefetched["handle"])
-                    with suppress(Exception):
-                        backend.wait(prefetched["handle"], timeout=5)
-                prefetched = None
-
-            prefetch_watch = None
-            if rife_prefetch_safe and carried_item is no_item:
-                prefetch_watch = _spawn_next_item_watch()
-
-            stats, next_prefetch = _stream_rife_esrgan_to_nvenc(
+            stats = _stream_rife_esrgan_to_nvenc(
                 esr,
-                current_prefetch["backend"] if current_prefetch is not None else create_backend(rife_backend_profile),
+                prefetched["backend"] if prefetched is not None else create_backend(rife_backend_profile),
                 raw_dir,
                 vid,
                 out_fps,
@@ -1119,19 +991,8 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                 h,
                 budget,
                 metrics,
-                prefetched=current_prefetch,
-                next_item_watch=prefetch_watch,
-                next_prefetch_start=_prefetch_item,
+                prefetched=prefetched,
             )
-
-            if prefetch_watch is not None:
-                prefetch_watch["ready"].wait()
-                if prefetch_watch["error"] is not None:
-                    raise RuntimeError("Next-chunk RIFE prefetch failed") from prefetch_watch["error"]
-                carried_item = prefetch_watch["item"]
-                prefetched = next_prefetch
-                if prefetched is None and carried_item is not no_item:
-                    prefetched = _prefetch_item(carried_item)
 
             prog.mark(cid, "rife")
             prog.mark(cid, "esrgan")
@@ -1179,11 +1040,11 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
                 f"esr={record.get('esrgan_seconds', 0.0):.1f}s "
                 f"encode={record.get('encode_seconds', 0.0):.1f}s "
                 f"total={dt_total:.1f}s "
-                f"win_avg={stats['window_avg_frames']:.1f} "
-                f"win_max={int(stats['window_max_frames'])} "
-                f"backlog_extract={stats['extract_peak_bytes'] / 1024**3:.2f}GiB "
-                f"backlog_rife={stats['rife_ready_peak_bytes'] / 1024**3:.2f}GiB "
-                f"nvenc_buf={int(stats['nvenc_peak_frames'])}",
+                f"win_avg={stats.get('window_avg_frames', 0.0):.1f} "
+                f"win_max={int(stats.get('window_max_frames', 0))} "
+                f"backlog_extract={stats.get('extract_peak_bytes', 0) / 1024**3:.2f}GiB "
+                f"backlog_rife={stats.get('rife_ready_peak_bytes', 0) / 1024**3:.2f}GiB "
+                f"nvenc_buf={int(stats.get('nvenc_peak_frames', 0))}",
                 flush=True,
             )
             print(
@@ -1194,6 +1055,9 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
             if metrics is not None:
                 metrics.emit(cid)
             _report_progress(total, done_n, counter, lock, t_start)
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             continue
 
         if frames is None:
@@ -1329,10 +1193,10 @@ def run(chunks, src: Path, work: Path, prog: Progress,
         if profile_tags:
             metrics.update(cid, **profile_tags)
 
-    q_extract = queue.Queue(maxsize=C.PIPELINE_DEPTH)
-    q_rife = queue.Queue(maxsize=C.PIPELINE_DEPTH)
-    q_encode = queue.Queue(maxsize=max(C.PIPELINE_DEPTH, 1))
-    direct_rife_stream = do_rife and do_esr
+    worker_depth = max(C.PIPELINE_DEPTH, C.RIFE_WORKERS)
+    q_extract = queue.Queue(maxsize=worker_depth)
+    q_rife = queue.Queue(maxsize=worker_depth)
+    q_encode = queue.Queue(maxsize=max(worker_depth, 1))
 
     t_start = time.time()
     encode_counter = [0]
@@ -1364,10 +1228,11 @@ def run(chunks, src: Path, work: Path, prog: Progress,
         budget,
         metrics,
     )
-    t_rife = None if direct_rife_stream else spawn(
-        "RIFE Interpolator (1260p)",
-        rife_first_worker,
+    t_rife = spawn(
+        "RIFE Dispatcher",
+        rife_dispatcher_worker,
         do_rife,
+        do_esr,
         fps,
         prog,
         q_extract,
@@ -1387,7 +1252,7 @@ def run(chunks, src: Path, work: Path, prog: Progress,
         fps,
         work,
         prog,
-        q_extract if direct_rife_stream else q_rife,
+        q_rife,
         q_encode,
         total,
         done_n,
@@ -1421,17 +1286,23 @@ def run(chunks, src: Path, work: Path, prog: Progress,
     if t_rife is not None:
         all_threads.insert(1, t_rife)
     sentinels_pushed = False
-    while any(thread.is_alive() for thread in all_threads):
-        if errors and not sentinels_pushed:
-            sentinels_pushed = True
+
+    def _push_sentinels():
+        """Unblock all queues so threads can exit."""
+        nonlocal sentinels_pushed
+        if sentinels_pushed:
+            return
+        sentinels_pushed = True
+        for q in (q_extract, q_rife):
             with suppress(queue.Full):
-                q_extract.put_nowait(None)
-            if t_rife is not None:
-                with suppress(queue.Full):
-                    q_rife.put_nowait(None)
-            for _ in encode_threads:
-                with suppress(queue.Full):
-                    q_encode.put_nowait(None)
+                q.put_nowait(None)
+        for _ in encode_threads:
+            with suppress(queue.Full):
+                q_encode.put_nowait(None)
+
+    while any(thread.is_alive() for thread in all_threads):
+        if errors or C.shutdown.is_set():
+            _push_sentinels()
         for thread in all_threads:
             thread.join(timeout=0.2)
 

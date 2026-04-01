@@ -54,7 +54,7 @@ class SchedulerProfile:
     ionice_class: int = 0
     ionice_level: int = 0
     use_chrt: bool = False
-    rife_threads: str = "1:8:4"
+    rife_threads: str = "1:4:4"
     chunk_seconds: int = 15
 
 
@@ -264,7 +264,7 @@ SCHEDULER_PROFILES: Dict[str, SchedulerProfile] = {
         ionice_level=0,
         use_chrt=True,
         chunk_seconds=30,
-        rife_threads="1:8:4",
+        rife_threads="1:4:4",
     ),
 }
 
@@ -282,6 +282,13 @@ RIFE_BACKEND_PROFILES: Dict[str, RIFEBackendProfile] = {
         backend="torch",
         device="cpu",
         model_name="paper_v6",
+    ),
+    "torch_cpu_parallel": RIFEBackendProfile(
+        name="torch_cpu_parallel",
+        backend="torch",
+        device="cpu",
+        model_name="paper_v6",
+        gpu=0,  # ignored for CPU
     ),
 }
 

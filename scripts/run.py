@@ -78,7 +78,7 @@ def main():
 
     effective_chunk = args.chunk if args.chunk is not None else sp.chunk_seconds or C.CHUNK_SECONDS
     effective_rife_threads = args.rife_threads or os.environ.get("ENHANCE_RIFE_THREADS") or sp.rife_threads or C.RIFE_THREADS
-    effective_rife_gpu = int(os.environ.get("ENHANCE_RIFE_GPU", str(rp.gpu)))
+    effective_rife_gpu = os.environ.get("ENHANCE_RIFE_GPU", str(rp.gpu))
 
     # Override config from profiles where applicable
     C.CHUNK_SECONDS = effective_chunk

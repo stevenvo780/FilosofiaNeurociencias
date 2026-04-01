@@ -88,8 +88,10 @@ class ESRGANEngine:
 
         self.cpu_enabled = C.CPU_SHARE > 0.0
         if self.cpu_enabled:
-            print(f"  [ESRGAN] CPU Worker (AMD Threads=16)  batch=1")
-            torch.set_num_threads(16)
+            import os
+            cpu_threads = os.cpu_count() or 16
+            print(f"  [ESRGAN] CPU Worker (AMD Threads={cpu_threads})  batch=1")
+            torch.set_num_threads(cpu_threads)
             model_path = self._resolve_model_path()
             m = spandrel.ModelLoader().load_from_file(model_path)
             self.cpu_model = m.model.to("cpu").eval()
@@ -652,6 +654,8 @@ class ESRGANEngine:
         telemetry_lock = threading.Lock()
 
         def get_batch(batch_size):
+            if C.shutdown.is_set():
+                return None, 0
             with lock:
                 if pos[0] >= total:
                     return None, 0

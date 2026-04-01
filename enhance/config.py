@@ -31,7 +31,7 @@ GPU1_BATCH = int(os.getenv("ENHANCE_GPU1_BATCH", "4"))
 
 GPU0_SHARE = 0.65  # RTX 5070 Ti
 GPU1_SHARE = 0.20  # RTX 2060
-CPU_SHARE = 0.0    # Disabled: CPU worker hurts GPU throughput.
+CPU_SHARE = float(os.getenv("ENHANCE_CPU_SHARE", "0.0"))    # Try "0.1" to saturate the CPU with ESRGAN
 
 READ_WORKERS = int(os.getenv("ENHANCE_READ_WORKERS", "16"))
 WRITE_WORKERS = int(os.getenv("ENHANCE_WRITE_WORKERS", "16"))
@@ -70,10 +70,18 @@ ESRGAN_GPUS = tuple(
     for token in os.getenv("ENHANCE_ESRGAN_GPUS", "0").split(",")
     if token.strip()
 )
-RIFE_GPU = int(os.getenv("ENHANCE_RIFE_GPU", "1"))
+RIFE_GPU = os.getenv("ENHANCE_RIFE_GPU", "1")
 # T13: Format "load:proc:save" for rife-ncnn-vulkan.
-# Default 1:8:4 works well. Benchmark alternatives: 1:4:4, 2:8:4, 1:16:4
-RIFE_THREADS = os.getenv("ENHANCE_RIFE_THREADS", "1:8:4")
+# Default 1:4:4 works well with 2 concurrent workers on 6GB VRAM.
+RIFE_THREADS = os.getenv("ENHANCE_RIFE_THREADS", "1:4:4")
+RIFE_WORKERS = max(int(os.getenv("ENHANCE_RIFE_WORKERS", "2")), 1)
+# Auto-divide CPU threads among concurrent RIFE workers to avoid over-subscription.
+# Default: cpu_count // RIFE_WORKERS.  Override: ENHANCE_RIFE_CPU_THREADS_PER_WORKER.
+RIFE_CPU_THREADS_PER_WORKER = max(
+    int(os.getenv("ENHANCE_RIFE_CPU_THREADS_PER_WORKER",
+                   str(max((os.cpu_count() or 16) // RIFE_WORKERS, 1)))),
+    1,
+)
 RIFE_STREAM_WINDOW = max(int(os.getenv("ENHANCE_RIFE_STREAM_WINDOW", "192")), 16)
 RIFE_MIN_WINDOW = max(int(os.getenv("ENHANCE_RIFE_MIN_WINDOW", "64")), 1)
 RIFE_POLL_SECONDS = float(os.getenv("ENHANCE_RIFE_POLL_SECONDS", "0.05"))
