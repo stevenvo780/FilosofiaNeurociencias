@@ -44,13 +44,13 @@ def main():
     ap.add_argument("--outdir", type=str, default=None,
                     help="Output directory (default: <input_dir>/enhanced)")
     ap.add_argument("--visual-profile", type=str, default=None,
-                    help="Visual quality profile (baseline, real_x2, real_x2plus, real_x4plus, hybrid_detail, face_adaptive, quality, face_preserve, production)")
+                    help="Visual quality profile (baseline, real_x2, real_x2plus, real_x4plus, general_light, general_light_wdn, hybrid_detail, face_adaptive, quality, face_preserve, production)")
     ap.add_argument("--audio-profile", type=str, default=None,
                     help="Audio processing profile (baseline, conservative, voice, natural, voice_natural, lecture_natural, production)")
     ap.add_argument("--scheduler-profile", type=str, default=None,
                     help="CPU scheduler profile (baseline, split_l3_a, split_l3_b, production)")
     ap.add_argument("--rife-backend", type=str, default=None,
-                    help="RIFE backend (baseline, torch)")
+                    help="RIFE backend (baseline, torch, torch_cpu)")
     ap.add_argument("--rife-threads", type=str, default=None,
                     help="Override RIFE thread tuple load:proc:save (e.g. 1:8:4)")
     ap.add_argument("--models-dir", type=str, default=None,

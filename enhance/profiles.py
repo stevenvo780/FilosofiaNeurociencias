@@ -63,6 +63,7 @@ class RIFEBackendProfile:
     """RIFE interpolation backend configuration."""
     name: str = "baseline"
     backend: str = "ncnn"
+    device: str = "cuda"
     gpu: int = 1
     stream_window: int = 192
     min_window: int = 64
@@ -101,6 +102,22 @@ VISUAL_PROFILES: Dict[str, VisualProfile] = {
         model_key="real_x4plus",
         downscale_factor=0.5,
         hybrid_detail_weight=0.08,
+    ),
+    "general_light": VisualProfile(
+        name="general_light",
+        model_key="general_x4v3",
+        downscale_factor=0.5,
+        hybrid_detail_weight=0.10,
+        face_adaptive=True,
+        face_roi=(0.5, 0.0, 1.0, 0.5),
+    ),
+    "general_light_wdn": VisualProfile(
+        name="general_light_wdn",
+        model_key="general_wdn_x4v3",
+        downscale_factor=0.5,
+        hybrid_detail_weight=0.08,
+        face_adaptive=True,
+        face_roi=(0.5, 0.0, 1.0, 0.5),
     ),
     "hybrid_detail": VisualProfile(
         name="hybrid_detail",
@@ -257,6 +274,11 @@ RIFE_BACKEND_PROFILES: Dict[str, RIFEBackendProfile] = {
     "torch": RIFEBackendProfile(
         name="torch",
         backend="torch",
+    ),
+    "torch_cpu": RIFEBackendProfile(
+        name="torch_cpu",
+        backend="torch",
+        device="cpu",
     ),
 }
 

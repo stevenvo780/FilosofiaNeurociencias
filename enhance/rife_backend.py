@@ -189,11 +189,12 @@ class TorchBackend(RIFEBackend):
       2. A future ``interpolate_tensors()`` method will skip PNG I/O entirely.
     """
 
-    def __init__(self, gpu: int = 0, model_name: str = "rife46") -> None:
+    def __init__(self, gpu: int = 0, model_name: str = "rife46", device: str | None = None) -> None:
         self._gpu = gpu
         self._model_name = model_name
         self._model: Any = None
-        self._device: str = f"cuda:{gpu}"
+        requested = (device or f"cuda:{gpu}").strip().lower()
+        self._device: str = "cpu" if requested == "cpu" else f"cuda:{gpu}"
 
         # Timing metrics
         self._spawn_t: float = 0.0
@@ -214,7 +215,9 @@ class TorchBackend(RIFEBackend):
 
         import torch
 
-        # Try loading from official RIFE repo via torch.hub
+        # Try loading from a local checkpoint first. The current wrapper still
+        # falls back to blend-only interpolation when the full IFNet graph is
+        # unavailable, so this backend remains experimental.
         model_dir = Path(C.TMPFS_WORK).parent / "rife_torch_models"
         model_dir.mkdir(parents=True, exist_ok=True)
         checkpoint = model_dir / f"{self._model_name}.pth"
@@ -434,7 +437,8 @@ def create_backend(profile: RIFEBackendProfile | None = None) -> RIFEBackend:
     if backend_name == "torch":
         gpu = effective_gpu
         model = getattr(profile, "model_name", "rife46")
-        return TorchBackend(gpu=gpu, model_name=model)
+        device = os.getenv("ENHANCE_RIFE_DEVICE", getattr(profile, "device", "cuda"))
+        return TorchBackend(gpu=gpu, model_name=model, device=device)
 
     # Default: ncnn
     gpu = effective_gpu

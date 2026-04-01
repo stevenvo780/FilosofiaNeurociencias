@@ -42,20 +42,30 @@ class ESRGANEngine:
         self.gpu_ids = configured[:2] or list(range(min(visible_gpus, 2)))
         self.ngpu = len(self.gpu_ids)
         self.models = []
+        self.gpu_total_mem_mib = {}
         self.batches = [
             C.GPU0_BATCH if gid == 0 else C.GPU1_BATCH
             for gid in self.gpu_ids
         ]
+
+        for gid in self.gpu_ids:
+            try:
+                props = torch.cuda.get_device_properties(gid)
+                self.gpu_total_mem_mib[gid] = int(props.total_memory / 1024**2)
+            except Exception:
+                self.gpu_total_mem_mib[gid] = 0
 
         for idx, gid in enumerate(self.gpu_ids):
             dev = f"cuda:{gid}"
             name = torch.cuda.get_device_name(gid)
             bs = self.batches[idx]
             print(f"  [ESRGAN] GPU{gid} {name}  batch={bs}")
-            if C.SHARE_RIFE_GPU and gid == C.RIFE_GPU and C.RIFE_SHARED_ESRGAN_TILE > 0:
+            if C.SHARE_RIFE_GPU and gid == C.RIFE_GPU:
+                shared_mode = "tiled" if self._use_tiled_shared_rife(gid) else "direct"
                 print(
-                    f"    shared-with-RIFE  tile={C.RIFE_SHARED_ESRGAN_TILE} "
-                    f"pad={C.RIFE_SHARED_ESRGAN_PAD}"
+                    f"    shared-with-RIFE {shared_mode}  "
+                    f"mem={self.gpu_total_mem_mib.get(gid, 0)}MiB  "
+                    f"tile={C.RIFE_SHARED_ESRGAN_TILE} pad={C.RIFE_SHARED_ESRGAN_PAD}"
                 )
 
             model_path = self._resolve_model_path()
@@ -136,6 +146,8 @@ class ESRGANEngine:
             C.SHARE_RIFE_GPU
             and dev_id == C.RIFE_GPU
             and C.RIFE_SHARED_ESRGAN_TILE > 0
+            and self.gpu_total_mem_mib.get(dev_id, 0)
+            <= C.RIFE_SHARED_ESRGAN_TILE_MAX_GPU_MEM_MIB
         )
 
     def _infer_tiled_u8(self, net, t_small, tile_size: int, tile_pad: int):
@@ -638,7 +650,7 @@ class ESRGANEngine:
         pos = [0]
         lock = threading.Lock()
         telemetry_lock = threading.Lock()
-        
+
         def get_batch(batch_size):
             with lock:
                 if pos[0] >= total:

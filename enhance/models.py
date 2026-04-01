@@ -60,6 +60,22 @@ KNOWN_MODELS = [
         scale=4,
         description="Real-ESRGAN x4plus general model for real-world scenes",
     ),
+    ModelEntry(
+        key="general_x4v3",
+        filename="realesr-general-x4v3.pth",
+        url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
+        sha256="8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292",
+        scale=4,
+        description="Compact Real-ESRGAN general model v3 for real-world scenes",
+    ),
+    ModelEntry(
+        key="general_wdn_x4v3",
+        filename="realesr-general-wdn-x4v3.pth",
+        url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth",
+        sha256="1641f8c4464b9f097c9fdda5589273713f67cf59f3d909e0bd688f0cee269dca",
+        scale=4,
+        description="Compact Real-ESRGAN general model v3 with stronger denoise",
+    ),
 ]
 
 # ---------------------------------------------------------------------------
