@@ -83,11 +83,6 @@ VISUAL_PROFILES: Dict[str, VisualProfile] = {
         model_key="anime_baseline",
         downscale_factor=0.5,
     ),
-    "fast": VisualProfile(
-        name="fast",
-        model_key="anime_baseline",
-        downscale_factor=0.5,
-    ),
     "real_x2": VisualProfile(
         name="real_x2",
         model_key="real_x2",
@@ -132,14 +127,6 @@ VISUAL_PROFILES: Dict[str, VisualProfile] = {
         downscale_factor=1.0,
         hybrid_detail_weight=0.2,
         face_adaptive=True,
-    ),
-    "quality": VisualProfile(
-        name="quality",
-        model_key="real_x2plus",
-        downscale_factor=1.0,
-        hybrid_detail_weight=0.15,
-        face_adaptive=True,
-        face_roi=(0.5, 0.0, 1.0, 0.5),  # top-right quadrant (speaker tile in Zoom)
     ),
     "face_preserve": VisualProfile(
         name="face_preserve",
@@ -208,16 +195,6 @@ AUDIO_PROFILES: Dict[str, AudioProfile] = {
             "alimiter=level_in=1:level_out=1:limit=0.95:release=50"
         ),
     ),
-    "lecture_natural": AudioProfile(
-        name="lecture_natural",
-        filter_chain=(
-            "highpass=f=80,"
-            "anlmdn=s=7:p=0.002:m=15,"
-            "dialoguenhance,"
-            "loudnorm=I=-16:TP=-1.5:LRA=11,"
-            "alimiter=level_in=1:level_out=1:limit=0.95:release=50"
-        ),
-    ),
     "production": AudioProfile(
         name="production",
         filter_chain=(
@@ -234,9 +211,6 @@ SCHEDULER_PROFILES: Dict[str, SchedulerProfile] = {
     "baseline": SchedulerProfile(
         name="baseline",
     ),
-    # T7: CCD-aware pinning with ionice + chrt for Ryzen 9 9950X3D dual-CCD.
-    # CCD0 cores 0-7 (threads 0-7,16-23) handle I/O-heavy ffmpeg/audio;
-    # CCD1 cores 8-15 (threads 8-15,24-31) handle Python/ESRGAN work.
     "split_l3_a": SchedulerProfile(
         name="split_l3_a",
         cpuset_ffmpeg="0-7,16-23",
@@ -253,8 +227,6 @@ SCHEDULER_PROFILES: Dict[str, SchedulerProfile] = {
         cpuset_python="0-7,16-23",
         rife_threads="2:8:4",
     ),
-    # T9: Production profile — CCD split + ionice/chrt + tuned chunk size.
-    # Use with ENHANCE_NVENC_GPUS=0,1 for dual-NVENC encoding.
     "production": SchedulerProfile(
         name="production",
         cpuset_ffmpeg="0-7,16-23",
@@ -271,24 +243,19 @@ SCHEDULER_PROFILES: Dict[str, SchedulerProfile] = {
 RIFE_BACKEND_PROFILES: Dict[str, RIFEBackendProfile] = {
     "baseline": RIFEBackendProfile(
         name="baseline",
-    ),
-    "torch": RIFEBackendProfile(
-        name="torch",
-        backend="torch",
-        model_name="paper_v6",
-    ),
-    "torch_cpu": RIFEBackendProfile(
-        name="torch_cpu",
         backend="torch",
         device="cpu",
         model_name="paper_v6",
     ),
-    "torch_cpu_parallel": RIFEBackendProfile(
-        name="torch_cpu_parallel",
+    "ncnn": RIFEBackendProfile(
+        name="ncnn",
+        backend="ncnn",
+    ),
+    "torch_gpu": RIFEBackendProfile(
+        name="torch_gpu",
         backend="torch",
-        device="cpu",
+        device="cuda",
         model_name="paper_v6",
-        gpu=0,  # ignored for CPU
     ),
 }
 

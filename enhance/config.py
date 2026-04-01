@@ -11,27 +11,18 @@ os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # ── PATHS ───────────────────────────────────────────────────
-_ESRGAN_MODEL_FALLBACK = "/tmp/realesr-animevideov3.pth"
-ESRGAN_MODEL = _ESRGAN_MODEL_FALLBACK  # backward-compat alias
+ESRGAN_MODEL = "/tmp/realesr-animevideov3.pth"
 RIFE_BIN = "/tmp/rife-ncnn/rife-ncnn-vulkan-20221029-ubuntu/rife-ncnn-vulkan"
 RIFE_MODEL_DIR = "/tmp/rife-ncnn/rife-ncnn-vulkan-20221029-ubuntu/rife-v4.6"
 TMPFS_WORK = "/tmp/enhance_work"  # tmpfs ramdisk for intermediate frames
 
 # ── TUNING ──────────────────────────────────────────────────
-# T8: Chunk duration in seconds. Also configurable via scheduler profiles
-# (SchedulerProfile.chunk_seconds) and the benchmark runner --chunk-seconds.
 CHUNK_SECONDS = int(os.getenv("ENHANCE_CHUNK_SECONDS", "15"))
 
-# T11: Tuned defaults. GPU0 (RTX 5070 Ti) has 16 GB VRAM, GPU1 (RTX 2060) has 6 GB.
-# With async D2H (T1), larger batches amortize transfer overhead better.
-# Recommended maximums: GPU0_BATCH=16 (~10 GB VRAM), GPU1_BATCH=8 (~3 GB VRAM).
-# Override via env: ENHANCE_GPU0_BATCH / ENHANCE_GPU1_BATCH.
 GPU0_BATCH = int(os.getenv("ENHANCE_GPU0_BATCH", "8"))
 GPU1_BATCH = int(os.getenv("ENHANCE_GPU1_BATCH", "4"))
 
-GPU0_SHARE = 0.65  # RTX 5070 Ti
-GPU1_SHARE = 0.20  # RTX 2060
-CPU_SHARE = float(os.getenv("ENHANCE_CPU_SHARE", "0.0"))    # Try "0.1" to saturate the CPU with ESRGAN
+CPU_SHARE = float(os.getenv("ENHANCE_CPU_SHARE", "0.0"))
 
 READ_WORKERS = int(os.getenv("ENHANCE_READ_WORKERS", "16"))
 WRITE_WORKERS = int(os.getenv("ENHANCE_WRITE_WORKERS", "16"))
@@ -51,15 +42,8 @@ CUDA_MATMUL_ALLOW_TF32 = os.getenv("ENHANCE_CUDA_MATMUL_ALLOW_TF32", "0") == "1"
 CUDNN_ALLOW_TF32 = os.getenv("ENHANCE_CUDNN_ALLOW_TF32", "1") == "1"
 CUDNN_BENCHMARK_LIMIT = int(os.getenv("ENHANCE_CUDNN_BENCHMARK_LIMIT", "10"))
 
-# T12: Hardware-accelerated decoding via NVDEC (h264_cuvid).
-# Beneficial when CPU extract is the bottleneck; adds ~0.5 GB VRAM.
-# Enable: ENHANCE_NVDEC=1
 ENABLE_NVDEC = os.getenv("ENHANCE_NVDEC", "0") == "1"
 
-# T9: NVENC encoding GPUs. The pipeline round-robins chunks across these GPUs.
-# For dual-NVENC on GPU0 + GPU1: ENHANCE_NVENC_GPUS=0,1
-# NOTE (T10): GPU1 may run at PCIe x4 instead of x16 — use check_pcie_width()
-# to verify link width before relying on GPU1 for encode-heavy workloads.
 NVENC_GPUS = tuple(
     int(token.strip())
     for token in os.getenv("ENHANCE_NVENC_GPUS", "0").split(",")
@@ -67,12 +51,10 @@ NVENC_GPUS = tuple(
 )
 ESRGAN_GPUS = tuple(
     int(token.strip())
-    for token in os.getenv("ENHANCE_ESRGAN_GPUS", "0").split(",")
+    for token in os.getenv("ENHANCE_ESRGAN_GPUS", "0,1").split(",")
     if token.strip()
 )
-RIFE_GPU = os.getenv("ENHANCE_RIFE_GPU", "1")
-# T13: Format "load:proc:save" for rife-ncnn-vulkan.
-# Default 1:4:4 works well with 2 concurrent workers on 6GB VRAM.
+RIFE_GPU = os.getenv("ENHANCE_RIFE_GPU", "0")
 RIFE_THREADS = os.getenv("ENHANCE_RIFE_THREADS", "1:4:4")
 RIFE_WORKERS = max(int(os.getenv("ENHANCE_RIFE_WORKERS", "2")), 1)
 # Auto-divide CPU threads among concurrent RIFE workers to avoid over-subscription.
@@ -91,10 +73,7 @@ RIFE_TORCH_MODEL_FILE = os.getenv("ENHANCE_RIFE_TORCH_MODEL_FILE", "")
 RIFE_TORCH_MODEL_DIR = os.getenv("ENHANCE_RIFE_TORCH_MODEL_DIR", "")
 RIFE_TORCH_THREADS = max(int(os.getenv("ENHANCE_RIFE_TORCH_THREADS", "0")), 0)
 RIFE_TORCH_BATCH = max(int(os.getenv("ENHANCE_RIFE_TORCH_BATCH", "2")), 1)
-RIFE_ALLOW_BLEND_FALLBACK = os.getenv("ENHANCE_RIFE_ALLOW_BLEND_FALLBACK", "0") == "1"
-# Allow ESRGAN CUDA work to share the same physical GPU as RIFE Vulkan during
-# direct streaming. This can improve occupancy, but on the RTX 2060 it may run
-# out of VRAM with real_x2plus quality profiles.
+# Only relevant when RIFE runs on GPU (ncnn/torch_gpu backends).
 SHARE_RIFE_GPU = os.getenv("ENHANCE_SHARE_RIFE_GPU", "0") == "1"
 RIFE_SHARED_ESRGAN_TILE = max(int(os.getenv("ENHANCE_RIFE_SHARED_ESRGAN_TILE", "256")), 0)
 RIFE_SHARED_ESRGAN_PAD = max(int(os.getenv("ENHANCE_RIFE_SHARED_ESRGAN_PAD", "16")), 0)
@@ -124,16 +103,6 @@ ESRGAN_EXPERIMENTAL_PINNED_STAGING = (
 ESRGAN_D2H_DOUBLE_BUFFER = (
     os.getenv("ENHANCE_ESRGAN_D2H_DOUBLE_BUFFER", "1") == "1"
 )
-
-# T16: GPU-resident pipeline — keep ESRGAN output tensors on GPU and attempt
-# direct CUDA→NVENC transfer via shared surfaces.  Experimental: requires
-# pynvvideocodec or compatible CUDA video encoder bindings.
-# When enabled and the required libraries are not available, falls back to the
-# standard pinned-memory D2H path transparently.
-ESRGAN_GPU_RESIDENT = (
-    os.getenv("ENHANCE_ESRGAN_GPU_RESIDENT", "0") == "1"
-)
-
 NVENC_PRESET = os.getenv("ENHANCE_NVENC_PRESET", "p1")
 NVENC_CQ = os.getenv("ENHANCE_NVENC_CQ", "19")
 NVENC_BITRATE = os.getenv("ENHANCE_NVENC_BITRATE", "20M")
@@ -153,10 +122,6 @@ AUDIO_FILTER = os.getenv(
 )
 
 # ── PROFILE-AWARE OVERLAY ───────────────────────────────────
-# These variables integrate with the new profile system (profiles.py,
-# audio_profiles.py, scheduler.py, rife_backend.py).  When set via env
-# vars the corresponding profile is loaded; otherwise the low-level
-# constants above are used directly (full backward compatibility).
 
 VISUAL_PROFILE_NAME = os.getenv("ENHANCE_VISUAL_PROFILE", None)
 AUDIO_PROFILE_NAME = os.getenv("ENHANCE_AUDIO_PROFILE", None)
@@ -189,33 +154,6 @@ def resolve_esrgan_model(profile_model_filename: str | None = None) -> str:
         if os.path.isfile(candidate):
             return candidate
     return ESRGAN_MODEL
-
-
-# ── DIAGNOSTICS ─────────────────────────────────────────────
-
-def check_pcie_width() -> None:
-    """Log PCIe link width for all visible GPUs. Warns if running degraded (T10)."""
-    import subprocess
-    try:
-        r = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,pcie.link.width.current,pcie.link.width.max",
-                "--format=csv,noheader",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if r.returncode == 0:
-            for line in r.stdout.strip().split("\n"):
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 3:
-                    idx, current, maximum = parts[0], parts[1], parts[2]
-                    status = "⚠️ DEGRADED" if int(current) < int(maximum) else "✓"
-                    print(f"  GPU{idx} PCIe x{current}/{maximum} {status}")
-    except Exception:
-        pass
 
 
 # ── GRACEFUL SHUTDOWN ───────────────────────────────────────

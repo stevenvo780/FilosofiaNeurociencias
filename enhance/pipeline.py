@@ -301,72 +301,6 @@ def _encode_from_numpy(frames: list[np.ndarray], out_file: Path,
         raise RuntimeError(f"NVENC encode failed (rc={proc.returncode})")
 
 
-def _try_gpu_resident_encode(tensors: list, out_file: Path,
-                              fps: float, gpu: int = 0) -> bool:
-    """T16: Attempt GPU-resident ESRGAN→NVENC encoding via CUDA shared surfaces.
-
-    Uses pynvvideocodec (PyNvVideoCodec) for direct GPU tensor → NVENC path
-    when available.  Returns True if successful, False if the library is not
-    installed or the encode fails (caller should fall back to pipe-based path).
-
-    Parameters
-    ----------
-    tensors : list of torch.Tensor
-        NHWC uint8 tensors on the target CUDA device.
-    out_file : Path
-        Output .mp4 path.
-    fps : float
-        Target framerate.
-    gpu : int
-        CUDA device ordinal for NVENC.
-    """
-    if not C.ESRGAN_GPU_RESIDENT:
-        return False
-
-    try:
-        # Check for PyNvVideoCodec or similar CUDA video encoder bindings
-        import PyNvVideoCodec as nvc  # type: ignore[import-not-found]
-    except ImportError:
-        return False
-
-    try:
-        import torch
-        if not tensors or not isinstance(tensors[0], torch.Tensor):
-            return False
-
-        h, w = tensors[0].shape[0], tensors[0].shape[1]
-        out_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # Create NVENC encoder with CUDA interop
-        encoder = nvc.CreateEncoder(
-            w, h, "hevc",
-            gpu_id=gpu,
-            preset="P1",
-            rate_control="VBR",
-            bitrate=int(C.NVENC_BITRATE.rstrip("M")) * 1_000_000,
-            max_bitrate=int(C.NVENC_MAXRATE.rstrip("M")) * 1_000_000,
-            fps=int(fps),
-        )
-
-        with open(str(out_file), "wb") as fout:
-            for tensor in tensors:
-                # Convert RGB → NV12 on GPU and encode
-                packet = encoder.encode_frame(tensor)
-                if packet:
-                    fout.write(packet)
-            # Flush encoder
-            while True:
-                packet = encoder.flush()
-                if not packet:
-                    break
-                fout.write(packet)
-
-        return True
-    except Exception:
-        # GPU-resident encode failed; caller falls back to pipe path
-        return False
-
-
 def _stream_esrgan_to_nvenc(esr: ESRGANEngine, frames: list[np.ndarray],
                             out_file: Path, fps: float, gpu: int) -> tuple[int, float]:
     """Upscale and encode a chunk without materializing 4K frames in RAM."""
@@ -449,11 +383,9 @@ def _cleanup_chunk_dir(path: Path):
     shutil.rmtree(path, ignore_errors=True)
 
 
-def _safe_nvenc_gpus() -> list[int]:
+def _safe_nvenc_gpus(rife_backend: RIFEBackend | None = None) -> list[int]:
     """Avoid placing NVENC on the same GPU that is busy running RIFE."""
-    backend_name = os.getenv("ENHANCE_RIFE_BACKEND", C.RIFE_BACKEND_NAME or "baseline")
-    rife_uses_gpu = backend_name != "torch_cpu" and os.getenv("ENHANCE_RIFE_DEVICE", "cuda") != "cpu"
-    if not rife_uses_gpu:
+    if rife_backend is not None and not rife_backend.uses_dedicated_gpu():
         return list(C.NVENC_GPUS)
     safe = [gpu for gpu in C.NVENC_GPUS if gpu != C.RIFE_GPU]
     return safe or list(C.NVENC_GPUS)
@@ -973,15 +905,16 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
         n = len(frames) if frames is not None else 0
 
         if do_esr and esr and do_rife and raw_dir is not None:
-            safe_nvenc_gpus = _safe_nvenc_gpus()
+            chunk_backend = prefetched["backend"] if prefetched is not None else create_backend(rife_backend_profile)
+            safe_nvenc_gpus = _safe_nvenc_gpus(chunk_backend)
             gpu = safe_nvenc_gpus[cid % len(safe_nvenc_gpus)]
-            expected = create_backend(rife_backend_profile).expected_output_frames(
+            expected = chunk_backend.expected_output_frames(
                 _count_numbered_pngs(raw_dir)
             )
 
             stats = _stream_rife_esrgan_to_nvenc(
                 esr,
-                prefetched["backend"] if prefetched is not None else create_backend(rife_backend_profile),
+                chunk_backend,
                 raw_dir,
                 vid,
                 out_fps,

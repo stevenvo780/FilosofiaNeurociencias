@@ -69,6 +69,13 @@ class RIFEBackend(ABC):
         """Whether this backend currently occupies `C.RIFE_GPU` for compute."""
         return False
 
+    def _reset_metrics(self) -> None:
+        self._spawn_t = 0.0
+        self._compute_t = 0.0
+        self._drain_t = 0.0
+        self._cleanup_t = 0.0
+        self._running_t0 = None
+
 
 # ── ncnn-Vulkan backend (wraps current rife.py logic) ───────────────────────
 
@@ -106,13 +113,6 @@ class NCNNBackend(RIFEBackend):
             "-j", self._threads,
             "-f", "%08d.png",
         ]
-
-    def _reset_metrics(self) -> None:
-        self._spawn_t = 0.0
-        self._compute_t = 0.0
-        self._drain_t = 0.0
-        self._cleanup_t = 0.0
-        self._running_t0 = None
 
     # -- ABC implementation ----------------------------------------------------
 
@@ -240,9 +240,7 @@ class TorchBackend(RIFEBackend):
                     flush=True,
                 )
             except Exception:
-                if not C.RIFE_ALLOW_BLEND_FALLBACK:
-                    raise
-                self._model = _BlendInterpolator(self._device)
+                raise
 
     # -- ABC implementation ------------------------------------------------
 
@@ -382,13 +380,6 @@ class TorchBackend(RIFEBackend):
     def uses_dedicated_gpu(self) -> bool:
         return self._device.startswith("cuda:")
 
-    def _reset_metrics(self) -> None:
-        self._spawn_t = 0.0
-        self._compute_t = 0.0
-        self._drain_t = 0.0
-        self._cleanup_t = 0.0
-        self._running_t0 = None
-
 
 class _TorchHandle:
     """Mimics subprocess.Popen for TorchBackend compatibility."""
@@ -410,22 +401,6 @@ class _TorchHandle:
 
     def terminate(self):
         C.shutdown.set()
-
-
-class _BlendInterpolator:
-    """Debug-only frame blending fallback.
-
-    This is useful to stress the scheduler, but it is not a valid substitute
-    for real RIFE quality and must never be treated as production output.
-    """
-
-    def __init__(self, device: str):
-        self._device = device
-
-    def interpolate(self, f0, f1):
-        """Return the mid-frame between f0 and f1 via alpha blending."""
-        import numpy as _np
-        return (f0.astype(_np.uint16) + f1.astype(_np.uint16) + 1) // 2
 
 
 # ── Factory ──────────────────────────────────────────────────────────────────
@@ -467,30 +442,3 @@ def create_backend(profile: RIFEBackendProfile | None = None) -> RIFEBackend:
     model_dir = getattr(profile, "model_dir", None) if profile is not None else None
     return NCNNBackend(gpu=gpu, threads=threads, rife_bin=rife_bin, model_dir=model_dir)
 
-
-# ── Module-level backward-compatible helpers ─────────────────────────────────
-# These mirror the original rife.py public API so existing callers keep working.
-
-_default_backend: NCNNBackend | None = None
-
-
-def _get_default() -> NCNNBackend:
-    global _default_backend
-    if _default_backend is None:
-        _default_backend = NCNNBackend()
-    return _default_backend
-
-
-def expected_output_frames(n_in: int) -> int:
-    """Backward-compatible wrapper — delegates to the default NCNNBackend."""
-    return _get_default().expected_output_frames(n_in)
-
-
-def start_interpolate(in_dir: Path, out_dir: Path) -> subprocess.Popen:
-    """Backward-compatible wrapper — delegates to the default NCNNBackend."""
-    return _get_default().start_interpolate(in_dir, out_dir)
-
-
-def interpolate(in_dir: Path, out_dir: Path) -> int:
-    """Backward-compatible wrapper — delegates to the default NCNNBackend."""
-    return _get_default().interpolate_sync(in_dir, out_dir)
