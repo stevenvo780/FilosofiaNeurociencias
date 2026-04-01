@@ -64,6 +64,10 @@ class RIFEBackend(ABC):
         """Return timing breakdown: spawn, compute, drain, cleanup seconds."""
         return {}
 
+    def uses_dedicated_gpu(self) -> bool:
+        """Whether this backend currently occupies `C.RIFE_GPU` for compute."""
+        return False
+
 
 # ── ncnn-Vulkan backend (wraps current rife.py logic) ───────────────────────
 
@@ -173,6 +177,9 @@ class NCNNBackend(RIFEBackend):
             "drain": self._drain_t,
             "cleanup": self._cleanup_t,
         }
+
+    def uses_dedicated_gpu(self) -> bool:
+        return True
 
 
 # ── Torch backend (stub — future pure-Python RIFE) ──────────────────────────
@@ -350,6 +357,9 @@ class TorchBackend(RIFEBackend):
             "drain": self._drain_t,
             "cleanup": self._cleanup_t,
         }
+
+    def uses_dedicated_gpu(self) -> bool:
+        return self._device.startswith("cuda:")
 
     def _reset_metrics(self) -> None:
         self._spawn_t = 0.0

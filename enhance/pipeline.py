@@ -6,6 +6,7 @@ hardware NVENC encode across chunk boundaries.
 """
 import gc
 import json
+import os
 import queue
 import shutil
 import subprocess
@@ -450,6 +451,10 @@ def _cleanup_chunk_dir(path: Path):
 
 def _safe_nvenc_gpus() -> list[int]:
     """Avoid placing NVENC on the same GPU that is busy running RIFE."""
+    backend_name = os.getenv("ENHANCE_RIFE_BACKEND", C.RIFE_BACKEND_NAME or "baseline")
+    rife_uses_gpu = backend_name != "torch_cpu" and os.getenv("ENHANCE_RIFE_DEVICE", "cuda") != "cpu"
+    if not rife_uses_gpu:
+        return list(C.NVENC_GPUS)
     safe = [gpu for gpu in C.NVENC_GPUS if gpu != C.RIFE_GPU]
     return safe or list(C.NVENC_GPUS)
 
@@ -624,6 +629,7 @@ def _stream_rife_esrgan_to_nvenc(esr: ESRGANEngine, rife_backend: RIFEBackend,
                 active_gpu_ids = list(esr.gpu_ids)
                 if (
                     rife_running
+                    and rife_backend.uses_dedicated_gpu()
                     and not C.SHARE_RIFE_GPU
                     and C.RIFE_GPU in active_gpu_ids
                 ):
@@ -966,7 +972,15 @@ def esrgan_worker(esr: ESRGANEngine | None, do_esr: bool, do_rife: bool,
     no_item = object()
     carried_item = no_item
     prefetched: dict | None = None
-    rife_prefetch_safe = esr is not None and C.RIFE_GPU not in set(esr.gpu_ids)
+    probe_backend = create_backend(rife_backend_profile) if do_rife else None
+    rife_prefetch_safe = (
+        esr is not None
+        and (
+            probe_backend is None
+            or not probe_backend.uses_dedicated_gpu()
+            or C.RIFE_GPU not in set(esr.gpu_ids)
+        )
+    )
 
     def _start_rife_prefetch(cid_pf: int, raw_dir_pf: Path) -> dict:
         """Start RIFE for the next chunk before the current ESRGAN begins."""
