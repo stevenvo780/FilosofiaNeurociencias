@@ -92,29 +92,23 @@ FilosofiaNeurociencias/
 ├── enhance/                        ← Paquete principal del pipeline
 │   ├── __init__.py
 │   ├── config.py                   ← Configuración centralizada (env vars + defaults)
-│   ├── esrgan.py                   ← Motor ESRGAN dual-GPU con batches dinámicos
+│   ├── esrgan.py                   ← Motor ESRGAN (batch inference fp16)
 │   ├── pipeline.py                 ← Pipeline 4 etapas (extract→rife→esrgan→nvenc)
 │   ├── rife_backend.py             ← Backend abstracto RIFE (ncnn + torch)
 │   ├── rife_torch_model.py         ← Implementación IFNet oficial para backend torch
-│   ├── ffmpeg_utils.py             ← Utilidades ffmpeg (extract, audio)
+│   ├── ffmpeg_utils.py             ← Utilidades ffmpeg (extract, encode, audio)
 │   ├── progress.py                 ← Tracking de progreso resumible por chunk
 │   ├── profiles.py                 ← Perfiles visuales, audio, scheduler, RIFE backend
 │   ├── models.py                   ← Registro de modelos con auto-download y SHA256
 │   ├── visual_eval.py              ← Evaluación visual ROI + blending facial
-│   ├── audio_profiles.py           ← Perfiles de audio y utilidades A/B
 │   └── scheduler.py                ← Afinidad CPU (taskset/ionice/chrt) por rol
 │
-├── scripts/                        ← Scripts de ejecución y herramientas
+├── scripts/                        ← Ejecución
 │   ├── run.py                      ← CLI principal
-│   ├── process_production.sh       ← Wrapper de producción con env vars de perfil
-│   ├── benchmark_runner.py         ← Runner de benchmarks con instrumentación
-│   ├── gate_acceptance.py          ← Gate de aceptación (throughput + calidad)
-│   ├── audio_ab_bench.py           ← Benchmark A/B de perfiles de audio
-│   └── test_components.py          ← Tests de componentes
+│   └── process_production.sh       ← Wrapper de producción con env vars
 │
-├── enhanced/                       ← Output y artefactos del pipeline
-│   ├── models/                     ← Pesos de modelos ESRGAN y RIFE
-│   └── audio_bench/                ← Resultados de benchmark de audio
+├── enhanced/                       ← Output
+│   └── models/                     ← Pesos de modelos ESRGAN y RIFE
 │
 ├── videos/                         ← Material fuente
 │   ├── GMT20260320-130023_Recording_2240x1260.mp4   ← Video de entrada
@@ -122,7 +116,7 @@ FilosofiaNeurociencias/
 │   └── enhanced/                   ← Outputs y directorios de trabajo
 │
 ├── README.md                       ← Este archivo
-└── TODO.md                         ← Tareas pendientes de optimización
+└── TODO.md                         ← Tareas pendientes
 ```
 
 ---
@@ -159,15 +153,15 @@ Toda la configuración se controla via variables de entorno en `enhance/config.p
 | Variable | Default | Descripción |
 |---|---|---|
 | `ENHANCE_CHUNK_SECONDS` | `15` | Duración de cada chunk |
-| `ENHANCE_GPU0_BATCH` | `8` | Batch size GPU0 (5070 Ti) |
-| `ENHANCE_GPU1_BATCH` | `4` | Batch size GPU1 (2060) |
+| `ENHANCE_GPU0_BATCH` | `4` | Batch size GPU0 (5070 Ti) |
+| `ENHANCE_GPU1_BATCH` | `1` | Batch size GPU1 (2060) |
 | `ENHANCE_ESRGAN_GPUS` | `0` | GPUs para ESRGAN |
 | `ENHANCE_RIFE_GPU` | `1` | GPU para RIFE Vulkan |
-| `ENHANCE_RIFE_THREADS` | `1:8:4` | Threads RIFE (j:p:t) |
+| `ENHANCE_RIFE_THREADS` | `1:4:4` | Threads RIFE (j:p:t) |
 | `ENHANCE_PIPELINE_DEPTH` | `2` | Profundidad del pipeline |
-| `ENHANCE_NVENC_PRESET` | `p1` | Preset NVENC |
-| `ENHANCE_NVENC_CQ` | `19` | Calidad constante NVENC |
-| `ENHANCE_NVENC_BITRATE` | `20M` | Bitrate objetivo |
+| `ENHANCE_NVENC_PRESET` | `p7` | Preset NVENC |
+| `ENHANCE_NVENC_CQ` | `20` | Calidad constante NVENC |
+| `ENHANCE_NVENC_BITRATE` | `40M` | Bitrate objetivo |
 
 ### Variables de perfil
 
@@ -197,21 +191,6 @@ bash scripts/process_production.sh
 
 Usa por defecto: `quality` visual, `natural` audio, `production` scheduler, `baseline` RIFE.
 
-### Benchmark instrumentado
-
-```bash
-python3 scripts/benchmark_runner.py \
-  --input videos/GMT20260320-130023_Recording_2240x1260.mp4 \
-  --tag test_v1 \
-  --slice-start 60 --slice-duration 60
-```
-
-### Gate de aceptación
-
-```bash
-python3 scripts/gate_acceptance.py enhanced/logs/bench_*/summary.json
-```
-
 ---
 
 ## 8. Perfiles
@@ -221,16 +200,15 @@ python3 scripts/gate_acceptance.py enhanced/logs/bench_*/summary.json
 | Perfil | Modelo | Face Adaptive |
 |---|---|---|
 | `baseline` | anime_baseline | No |
-| `quality` | realesrgan_x2plus | Sí |
-| `production` | realesrgan_x2plus | Sí |
-| `face_preserve` | realesrgan_x2plus | Sí |
+| `quality` | real_x2plus | Sí |
+| `production` | real_x2plus | Sí |
 
 ### Audio
 
 | Perfil | Filtros |
 |---|---|
 | `baseline` | afftdn + loudnorm + dynaudnorm |
-| `natural` | afftdn + loudnorm + alimiter |
+| `natural` | highpass + anlmdn + loudnorm + alimiter |
 | `production` | highpass + anlmdn + dialoguenhance + loudnorm + alimiter |
 
 ### Scheduler
