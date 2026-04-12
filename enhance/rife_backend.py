@@ -222,7 +222,7 @@ class TorchBackend(RIFEBackend):
         with self._model_lock:
             if self._model is not None:
                 return
-            effective_threads = self._cpu_threads or C.RIFE_CPU_THREADS_PER_WORKER or C.RIFE_TORCH_THREADS
+            effective_threads = self._cpu_threads or (os.cpu_count() or 16)
             try:
                 checkpoint = ensure_torch_rife_checkpoint(
                     model_name=self._model_name,
@@ -277,9 +277,17 @@ class TorchBackend(RIFEBackend):
 
     def _interpolate_worker(self, in_dir: Path, out_dir: Path,
                             handle: '_TorchHandle') -> None:
-        """Background worker: read PNGs → interpolate → write PNGs."""
+        """Background worker: read PNGs → interpolate → write PNGs.
+
+        Uses concurrent segment workers to saturate all CPU cores:
+        - Splits input frames into N segments (N = number of workers)
+        - Each segment runs interpolation concurrently
+        - PyTorch releases the GIL during compute, enabling true parallelism
+        - PNG I/O is parallelized across segments
+        """
         import torch
         import cv2
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         out_dir.mkdir(parents=True, exist_ok=True)
         t0 = time.monotonic()
@@ -293,58 +301,117 @@ class TorchBackend(RIFEBackend):
             img = cv2.imread(str(path), cv2.IMREAD_COLOR)
             return cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else None
 
-        prev = _read_rgb(png_paths[0])
-        if prev is None:
+        # Pre-read all frames in parallel (tmpfs so I/O is fast)
+        with ThreadPoolExecutor(max_workers=min(16, len(png_paths))) as pool:
+            all_frames = list(pool.map(_read_rgb, png_paths))
+
+        if all_frames[0] is None:
             handle._returncode = 1
             return
 
-        if len(png_paths) == 1:
+        if len(all_frames) == 1:
             for i in range(2):
                 dst = out_dir / f"{i + 1:08d}.png"
-                cv2.imwrite(str(dst), cv2.cvtColor(prev, cv2.COLOR_RGB2BGR))
+                cv2.imwrite(str(dst), cv2.cvtColor(all_frames[0], cv2.COLOR_RGB2BGR))
             handle._returncode = 0
             return
 
         self._spawn_t = time.monotonic() - t0
         t1 = time.monotonic()
 
-        out_idx = 1
-        next_pos = 1
-        with torch.inference_mode():
-            while next_pos < len(png_paths):
-                if C.shutdown.is_set():
-                    handle._returncode = -1
-                    return
+        n_frames = len(all_frames)
+        # Use fewer torch threads per call, run multiple concurrent workers
+        n_workers = max(1, min(C.RIFE_WORKERS, n_frames - 1))
+        threads_per_worker = max(1, (os.cpu_count() or 16) // n_workers)
+        torch.set_num_threads(threads_per_worker)
 
-                batch_frames = [prev]
-                while len(batch_frames) < self._batch_size + 1 and next_pos < len(png_paths):
-                    curr = _read_rgb(png_paths[next_pos])
-                    next_pos += 1
-                    if curr is None:
-                        handle._returncode = 1
-                        return
-                    batch_frames.append(curr)
+        # Split frames into overlapping segments for concurrent processing
+        # Each segment needs [start..end] frames, overlapping by 1 at boundaries
+        segment_size = max(2, (n_frames + n_workers - 1) // n_workers)
+        segments = []
+        for i in range(0, n_frames - 1, segment_size - 1):
+            seg_end = min(i + segment_size, n_frames)
+            segments.append((i, seg_end))
+            if seg_end >= n_frames:
+                break
 
-                mids = self._model.interpolate_many(batch_frames[:-1], batch_frames[1:])
-                for idx, mid in enumerate(mids):
-                    dst = out_dir / f"{out_idx:08d}.png"
-                    cv2.imwrite(str(dst), cv2.cvtColor(batch_frames[idx], cv2.COLOR_RGB2BGR))
-                    out_idx += 1
+        # Each segment produces 2*(seg_len-1) + 2 output frames (last seg gets +2 for tail)
+        # Calculate output index offsets
+        seg_out_offsets = []
+        out_offset = 1
+        for seg_idx, (seg_start, seg_end) in enumerate(segments):
+            seg_out_offsets.append(out_offset)
+            n_pairs = seg_end - seg_start - 1
+            out_offset += n_pairs * 2
 
-                    dst = out_dir / f"{out_idx:08d}.png"
-                    cv2.imwrite(str(dst), cv2.cvtColor(mid, cv2.COLOR_RGB2BGR))
-                    out_idx += 1
+        # Add 2 for the duplicated final frame
+        total_out = out_offset + 1
 
-                prev = batch_frames[-1]
+        write_lock = threading.Lock()
+        errors = []
 
-            # Match ncnn's exact 2x frame count by duplicating the final frame.
-            for _ in range(2):
-                dst = out_dir / f"{out_idx:08d}.png"
-                cv2.imwrite(str(dst), cv2.cvtColor(prev, cv2.COLOR_RGB2BGR))
-                out_idx += 1
+        def _process_segment(seg_idx: int, seg_start: int, seg_end: int, out_base: int):
+            """Process a segment of consecutive frames."""
+            try:
+                frames = all_frames[seg_start:seg_end]
+                local_out_idx = out_base
+                batch_size = self._batch_size
+
+                pos = 0
+                with torch.inference_mode():
+                    while pos < len(frames) - 1:
+                        if C.shutdown.is_set():
+                            return
+
+                        end = min(pos + batch_size + 1, len(frames))
+                        batch = frames[pos:end]
+
+                        mids = self._model.interpolate_many(batch[:-1], batch[1:])
+                        for idx, mid in enumerate(mids):
+                            dst = out_dir / f"{local_out_idx:08d}.png"
+                            cv2.imwrite(str(dst), cv2.cvtColor(batch[idx], cv2.COLOR_RGB2BGR))
+                            local_out_idx += 1
+
+                            dst = out_dir / f"{local_out_idx:08d}.png"
+                            cv2.imwrite(str(dst), cv2.cvtColor(mid, cv2.COLOR_RGB2BGR))
+                            local_out_idx += 1
+
+                        pos = end - 1
+
+                # Last segment: duplicate final frame (match ncnn 2x count)
+                if seg_idx == len(segments) - 1:
+                    last_frame = frames[-1]
+                    for _ in range(2):
+                        dst = out_dir / f"{local_out_idx:08d}.png"
+                        cv2.imwrite(str(dst), cv2.cvtColor(last_frame, cv2.COLOR_RGB2BGR))
+                        local_out_idx += 1
+            except Exception as exc:
+                errors.append(exc)
+
+        if len(segments) == 1:
+            # Single segment: run directly
+            _process_segment(0, segments[0][0], segments[0][1], seg_out_offsets[0])
+        else:
+            # Multiple segments: run concurrently
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = []
+                for seg_idx, ((seg_start, seg_end), out_base) in enumerate(
+                    zip(segments, seg_out_offsets)
+                ):
+                    futures.append(
+                        pool.submit(_process_segment, seg_idx, seg_start, seg_end, out_base)
+                    )
+                for f in as_completed(futures):
+                    f.result()
+
+        # Restore full thread count
+        torch.set_num_threads(os.cpu_count() or 16)
 
         self._compute_t = time.monotonic() - t1
-        handle._returncode = 0
+        if errors:
+            handle._returncode = 1
+        else:
+            handle._returncode = 0
 
     def interpolate_sync(self, in_dir: Path, out_dir: Path) -> int:
         handle = self.start_interpolate(in_dir, out_dir)
@@ -425,7 +492,12 @@ def create_backend(profile: RIFEBackendProfile | None = None) -> RIFEBackend:
         device = os.getenv("ENHANCE_RIFE_DEVICE", getattr(profile, "device", "cuda"))
         model_file = os.getenv("ENHANCE_RIFE_TORCH_MODEL_FILE", "")
         model_dir = os.getenv("ENHANCE_RIFE_TORCH_MODEL_DIR", "")
-        cpu_threads = int(os.getenv("ENHANCE_RIFE_TORCH_THREADS", str(C.RIFE_TORCH_THREADS)))
+        explicit_threads = int(os.getenv("ENHANCE_RIFE_TORCH_THREADS", str(C.RIFE_TORCH_THREADS)))
+        # When running on CPU, use all available cores unless explicitly overridden
+        if explicit_threads == 0 and device.strip().lower() == "cpu":
+            cpu_threads = os.cpu_count() or 16
+        else:
+            cpu_threads = explicit_threads
         return TorchBackend(
             gpu=gpu,
             model_name=model,

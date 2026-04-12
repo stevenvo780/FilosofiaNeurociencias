@@ -1,7 +1,17 @@
+# Output and media
 enhanced/
+videos/
+backups/
 *.mp4
 *.m4a
-*/__pycache__/
+*.mkv
+*.wav
+*.flac
+
+# Python
 __pycache__/
-*.pyc*
-videos/*
+*.pyc
+
+# Misc
+nohup.out
+*.log
