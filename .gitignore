@@ -1,17 +1,19 @@
-# Output and media
-enhanced/
-videos/
-backups/
+# Media
 *.mp4
 *.m4a
 *.mkv
 *.wav
 *.flac
+videos/
+enhanced/
 
-# Python
-__pycache__/
-*.pyc
+# Work directories
+work_*/
+
+# Video2X AppImage
+*.AppImage
 
 # Misc
 nohup.out
 *.log
+backups/

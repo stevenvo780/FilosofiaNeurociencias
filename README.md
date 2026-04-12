@@ -1,248 +1,125 @@
-# Video Enhancement Pipeline — FilosofiaNeurociencias
+# Video Enhancement Pipeline
 
-> Pipeline de mejora de video para una grabación Zoom.
-> **Entrada**: 2240×1260 @ 25fps H.264 → **Salida**: 4480×2520 @ 50fps HEVC 4K
-> **Hardware**: Ryzen 9 9950X3D · RTX 5070 Ti · RTX 2060 · 128 GB DDR5
-
----
-
-## 1. Arquitectura del Pipeline
+> Toma un video → duplica resolución → duplica FPS → limpia audio.
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                         PIPELINE v8 — 4 etapas                               │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌────────────┐    ┌──────────────────┐    ┌──────────────────────────────┐  │
-│  │  EXTRACT   │───►│  RIFE (1260p)    │───►│  ESRGAN (4K) dual-GPU batch │  │
-│  │  ffmpeg    │    │  Vulkan GPU1     │    │  CUDA GPU0 (bs=8)           │  │
-│  │  CPU       │    │  rife-ncnn-vk    │    │  CUDA GPU1 (bs=4)           │  │
-│  └────────────┘    └──────────────────┘    └──────────────┬───────────────┘  │
-│                                                           │                  │
-│                                                   ┌───────▼──────────────┐   │
-│                                                   │  NVENC (HEVC 4K)     │   │
-│                                                   │  hevc_nvenc GPU0     │   │
-│                                                   │  Streaming via pipe  │   │
-│                                                   └──────────────────────┘   │
-│                                                                              │
-│  Audio: procesado en paralelo en CPU (afftdn + loudnorm + alimiter)          │
-│  Intermedios: tmpfs /tmp (RAM, zero I/O disco)                               │
-│  Progreso: resumible por chunk (progress.json)                               │
-└──────────────────────────────────────────────────────────────────────────────┘
+Entrada: 2240×1260 @ 25fps  →  Salida: 4480×2520 @ 50fps + audio mejorado
 ```
 
-### Flujo por chunk
+## Requisitos
 
-1. **Extract** — ffmpeg decodifica un segmento de N segundos a frames RGB en RAM
-2. **RIFE** — rife-ncnn-vulkan interpola 2× a resolución original (1260p), duplicando frames
-3. **ESRGAN** — modelo de super-resolución sube de 1260p a 4K (dual-GPU con distribución dinámica)
-4. **NVENC** — codifica HEVC 4K vía pipe stdin con reorder buffer para frames out-of-order
+- **[Video2X](https://github.com/k4yt3x/video2x)** — Real-ESRGAN (upscale) + RIFE (interpolación)
+- **ffmpeg** + **ffprobe** — split, concat, audio
+- **GPU con Vulkan** — NVIDIA, AMD o Intel
 
----
+### Instalar Video2X
 
-## 2. Hardware del Sistema
+```bash
+# AppImage (cualquier distro Linux)
+wget https://github.com/k4yt3x/video2x/releases/latest/download/Video2X-x86_64.AppImage
+chmod +x Video2X-x86_64.AppImage
+export V2X_BIN="$PWD/Video2X-x86_64.AppImage"
 
-### CPU — AMD Ryzen 9 9950X3D
-
-| Spec | Valor |
-|---|---|
-| Arquitectura | Zen 5 + 3D V-Cache |
-| Cores / Threads | 16C / 32T |
-| L3 Cache | 128 MB (dual CCD) |
-| RAM | 128 GB DDR5 |
-
-### GPU0 — NVIDIA RTX 5070 Ti (Blackwell)
-
-| Recurso | Valor |
-|---|---|
-| VRAM | 16 GB GDDR7 |
-| CUDA Cores | ~8960 |
-| Compute Cap | 12.0 |
-| Rol | ESRGAN principal + NVENC |
-
-### GPU1 — NVIDIA RTX 2060 (Turing)
-
-| Recurso | Valor |
-|---|---|
-| VRAM | 6 GB GDDR6 |
-| CUDA Cores | 1920 |
-| Compute Cap | 7.5 |
-| Rol | RIFE Vulkan |
-| ⚠️ | PCIe negociando x4 (límite HW) |
-
----
-
-## 3. Software Stack
-
-| Componente | Versión | Uso |
-|---|---|---|
-| Python | 3.x | Pipeline principal |
-| PyTorch | 2.10.0 + CUDA 12.8 | ESRGAN inference (fp16) |
-| Vulkan | 1.4.321 | RIFE interpolación |
-| spandrel | 0.4.2 | Carga de modelos ESRGAN |
-| FFmpeg | 7.1.1 | Extract, encode, audio |
-| RIFE | rife-ncnn-vulkan 20221029 | Interpolación de frames |
-
----
-
-## 4. Estructura de Archivos
-
-```
-FilosofiaNeurociencias/
-├── enhance/                        ← Paquete principal del pipeline
-│   ├── __init__.py
-│   ├── config.py                   ← Configuración centralizada (env vars + defaults)
-│   ├── esrgan.py                   ← Motor ESRGAN (batch inference fp16)
-│   ├── pipeline.py                 ← Pipeline 4 etapas (extract→rife→esrgan→nvenc)
-│   ├── rife_backend.py             ← Backend abstracto RIFE (ncnn + torch)
-│   ├── rife_torch_model.py         ← Implementación IFNet oficial para backend torch
-│   ├── ffmpeg_utils.py             ← Utilidades ffmpeg (extract, encode, audio)
-│   ├── progress.py                 ← Tracking de progreso resumible por chunk
-│   ├── profiles.py                 ← Perfiles visuales, audio, scheduler, RIFE backend
-│   ├── models.py                   ← Registro de modelos con auto-download y SHA256
-│   ├── visual_eval.py              ← Evaluación visual ROI + blending facial
-│   └── scheduler.py                ← Afinidad CPU (taskset/ionice/chrt) por rol
-│
-├── scripts/                        ← Ejecución
-│   ├── run.py                      ← CLI principal
-│   └── process_production.sh       ← Wrapper de producción con env vars
-│
-├── enhanced/                       ← Output
-│   └── models/                     ← Pesos de modelos ESRGAN y RIFE
-│
-├── videos/                         ← Material fuente
-│   ├── GMT20260320-130023_Recording_2240x1260.mp4   ← Video de entrada
-│   ├── GMT20260320-130023_Recording.m4a             ← Audio separado
-│   └── enhanced/                   ← Outputs y directorios de trabajo
-│
-├── README.md                       ← Este archivo
-└── TODO.md                         ← Tareas pendientes
+# Arch Linux
+yay -S video2x
 ```
 
----
+## Uso
 
-## 5. Video de Entrada
+```bash
+# Básico — output junto al input
+./enhance.sh video.mp4
 
-| Propiedad | Valor |
-|---|---|
-| Archivo | `GMT20260320-130023_Recording_2240x1260.mp4` |
-| Video codec | H.264 (AVC) |
-| Resolución | 2240 × 1260 |
-| FPS | 25 |
-| Audio | AAC 48kHz stereo |
-| Duración | ~7.4 horas |
+# Especificar output
+./enhance.sh video.mp4 video_4k_50fps.mp4
 
-### Salida esperada
+# Con audio externo (sidecar .m4a de Zoom, etc.)
+./enhance.sh video.mp4 output.mp4 audio.m4a
+```
 
-| Propiedad | Valor |
-|---|---|
-| Video codec | HEVC (hevc_nvenc) |
-| Resolución | 4480 × 2520 |
-| FPS | 50 |
-| Video bitrate | 20 Mbps (CQ 19) |
-| Audio | AAC 256kbps (procesado con perfil `natural`) |
-
----
-
-## 6. Configuración
-
-Toda la configuración se controla via variables de entorno en `enhance/config.py`.
-
-### Variables principales
+### Variables de entorno
 
 | Variable | Default | Descripción |
 |---|---|---|
-| `ENHANCE_CHUNK_SECONDS` | `15` | Duración de cada chunk |
-| `ENHANCE_GPU0_BATCH` | `4` | Batch size GPU0 (5070 Ti) |
-| `ENHANCE_GPU1_BATCH` | `1` | Batch size GPU1 (2060) |
-| `ENHANCE_ESRGAN_GPUS` | `0` | GPUs para ESRGAN |
-| `ENHANCE_RIFE_GPU` | `1` | GPU para RIFE Vulkan |
-| `ENHANCE_RIFE_THREADS` | `1:4:4` | Threads RIFE (j:p:t) |
-| `ENHANCE_PIPELINE_DEPTH` | `2` | Profundidad del pipeline |
-| `ENHANCE_NVENC_PRESET` | `p7` | Preset NVENC |
-| `ENHANCE_NVENC_CQ` | `20` | Calidad constante NVENC |
-| `ENHANCE_NVENC_BITRATE` | `40M` | Bitrate objetivo |
+| `V2X_BIN` | `video2x` | Ruta al binario/AppImage de Video2X |
+| `V2X_UPSCALE_FACTOR` | `2` | Multiplicador de resolución |
+| `V2X_UPSCALE_MODEL` | `realesr-animevideov3` | Modelo Real-ESRGAN |
+| `V2X_INTERP_FACTOR` | `2` | Multiplicador de FPS |
+| `V2X_INTERP_MODEL` | `rife-v4.6` | Modelo RIFE |
+| `V2X_GPU` | `0` | Índice de dispositivo Vulkan |
+| `V2X_GPU_WORKERS` | `4` | Workers paralelos por chunk |
+| `CHUNK_MINUTES` | `15` | Minutos por chunk |
+| `AUDIO_FILTER` | `highpass+anlmdn+loudnorm+alimiter` | Filtro ffmpeg de audio |
 
-### Variables de perfil
-
-| Variable | Default | Descripción |
-|---|---|---|
-| `ENHANCE_VISUAL_PROFILE` | `None` | Perfil visual |
-| `ENHANCE_AUDIO_PROFILE` | `None` | Perfil de audio |
-| `ENHANCE_SCHEDULER_PROFILE` | `None` | Perfil de scheduler CPU |
-| `ENHANCE_RIFE_BACKEND` | `None` | Backend RIFE |
-
----
-
-## 7. Uso
-
-### Ejecución básica
+### Ejemplos
 
 ```bash
-python3 scripts/run.py videos/GMT20260320-130023_Recording_2240x1260.mp4 \
-  --outdir enhanced/
+# Más workers para saturar la GPU
+V2X_GPU_WORKERS=6 ./enhance.sh video.mp4
+
+# AppImage custom
+V2X_BIN=./Video2X-x86_64.AppImage ./enhance.sh video.mp4
+
+# Solo upscale sin interpolación
+V2X_INTERP_FACTOR=1 ./enhance.sh video.mp4
+
+# Upscale ×4 (requiere más VRAM)
+V2X_UPSCALE_FACTOR=4 ./enhance.sh video.mp4
 ```
 
-### Producción (con perfiles)
+## Qué hace el script
 
-```bash
-bash scripts/process_production.sh
+```
+1. Split      →  ffmpeg divide el video en chunks de N min (-c copy, sin re-encode)
+2. Upscale    →  Video2X: realesrgan -s N  (por chunk, en paralelo)
+3. Interpolar →  Video2X: rife -m N        (por chunk, en paralelo)
+4. Audio      →  ffmpeg aplica filtro de limpieza (en paralelo con pasos 2-3)
+5. Concat     →  ffmpeg concatena chunks + muxa audio mejorado
 ```
 
-Usa por defecto: `quality` visual, `natural` audio, `production` scheduler, `baseline` RIFE.
+Video2X ejecuta un procesador por invocación, así que upscale e interpolación
+son dos pasadas separadas por chunk. Los intermedios de upscale se eliminan
+automáticamente después de interpolar.
 
----
+### Pipeline de audio
 
-## 8. Perfiles
+```
+highpass=f=80              → elimina rumble <80Hz
+anlmdn=s=7:p=0.002:m=15   → denoising no-local means
+loudnorm=I=-16:TP=-1.5     → normalización EBU R128
+alimiter=limit=0.95        → limiter para evitar clipping
+```
 
-### Visual
+## Hardware de referencia
 
-| Perfil | Modelo | Face Adaptive |
+| Componente | Modelo | Notas |
 |---|---|---|
-| `baseline` | anime_baseline | No |
-| `quality` | real_x2plus | Sí |
-| `production` | real_x2plus | Sí |
+| CPU | Ryzen 9 9950X3D | ffmpeg encode/decode |
+| GPU0 | RTX 5070 Ti 16GB | 4 workers ESRGAN |
+| GPU1 | RTX 2060 6GB | 1 worker (PCIe ×4) |
+| RAM | 128 GB DDR5 | — |
 
-### Audio
+Con 5 workers totales en producción: **~8.5 FPS** para upscale ×2.
 
-| Perfil | Filtros |
-|---|---|
-| `baseline` | afftdn + loudnorm + dynaudnorm |
-| `natural` | highpass + anlmdn + loudnorm + alimiter |
-| `production` | highpass + anlmdn + dialoguenhance + loudnorm + alimiter |
+## Estructura
 
-### Scheduler
+```
+.
+├── enhance.sh       ← el script (esto es todo)
+├── videos/          ← videos de entrada
+├── enhanced/        ← outputs
+├── README.md
+├── TODO.md
+└── .gitignore
+```
 
-| Perfil | Estrategia |
-|---|---|
-| `baseline` | Sin afinidad |
-| `production` | CCD split + ionice + chrt |
+## Lección aprendida
 
----
+Se intentó un pipeline custom en Python (~4500 LOC, 12 archivos, ~30h):
+ESRGAN PyTorch, RIFE ncnn, streaming NVENC, scheduler CCD-aware, face-adaptive
+blending, perfiles de audio, progreso resumible por chunk...
 
-## 9. Rendimiento
+Al final, **Video2X con workers encolados hizo lo mismo con 0 líneas de código**.
+La única adición útil fue el filtro de audio de ffmpeg (~1 línea).
 
-### Mejor benchmark sostenido
-
-| Métrica | Valor |
-|---|---|
-| throughput | 0.4198× realtime (300s) |
-| effective_fps | 24.0 |
-| GPU0 avg | 70.8% |
-| GPU1 avg | 62.3% |
-| CPU avg | 30.9% |
-
-### Speedup acumulado v1→v8: 6.6×
-
----
-
-## 10. Decisiones Técnicas Cerradas
-
-| Decisión | Razón |
-|---|---|
-| CPU ESRGAN deshabilitado | Destruye rendimiento GPU (-29%) |
-| RIFE a 1260p (no 4K) | 3.8× más rápido, sin pérdida de calidad |
-| CPU_SHARE = 0 | Benchmarked: siempre peor con CPU worker |
-| HEVC como codec | Balance calidad/velocidad |
-| tmpfs para intermedios | Elimina I/O de disco |
-| Perfil audio `natural` | Sin dynaudnorm, voz más natural |
+> Si existe una herramienta open-source madura para tu problema, úsala primero.
