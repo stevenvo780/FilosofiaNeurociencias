@@ -6,6 +6,7 @@
 *.flac
 videos/
 enhanced/
+output
 
 # Work directories
 work_*/

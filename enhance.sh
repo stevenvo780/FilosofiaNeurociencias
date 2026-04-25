@@ -1,58 +1,54 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────
-#  enhance.sh — Video enhancement pipeline
+#  enhance.sh — Dual-GPU video enhancement pipeline
 #
 #  Uses Video2X for upscale (Real-ESRGAN) + frame interpolation (RIFE)
-#  and ffmpeg for audio enhancement.
+#  Distributes chunks across two GPUs with proportional workers.
 #
-#  Video2X runs ONE processor per invocation, so upscale and interpolation
-#  are two separate passes per chunk:
+#  Video2X runs ONE processor per invocation:
 #    1) video2x -p realesrgan -s N   (upscale)
 #    2) video2x -p rife -m N         (frame interpolation)
 #
-#  Result: resolution ×2, FPS ×2, cleaned audio.
+#  Result: resolution ×2, FPS ×2, original audio preserved.
 #
 #  Usage:
 #    ./enhance.sh input.mp4
-#    ./enhance.sh input.mp4 output.mp4
-#    ./enhance.sh input.mp4 output.mp4 audio_sidecar.m4a
+#    ./enhance.sh input.mp4 output.mkv
+#    ./enhance.sh input.mp4 output.mkv audio_sidecar.m4a
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
 
 # ── Config (override via env) ────────────────────────────────
-V2X_BIN="${V2X_BIN:-video2x}"                    # video2x binary or AppImage path
-V2X_UPSCALE_FACTOR="${V2X_UPSCALE_FACTOR:-2}"    # resolution multiplier
-V2X_UPSCALE_MODEL="${V2X_UPSCALE_MODEL:-realesr-animevideov3}"  # --realesrgan-model
-V2X_INTERP_FACTOR="${V2X_INTERP_FACTOR:-2}"      # FPS multiplier (frame rate mul)
-V2X_INTERP_MODEL="${V2X_INTERP_MODEL:-rife-v4.6}"              # --rife-model
-V2X_GPU="${V2X_GPU:-0}"                           # Vulkan device index
-V2X_GPU_WORKERS="${V2X_GPU_WORKERS:-4}"           # parallel chunk workers
-V2X_EXTRA_ARGS="${V2X_EXTRA_ARGS:-}"             # any extra video2x args
+V2X_BIN="${V2X_BIN:-$(dirname "$(realpath "$0")")/Video2X-x86_64.AppImage}"
+V2X_UPSCALE_FACTOR="${V2X_UPSCALE_FACTOR:-2}"
+V2X_UPSCALE_MODEL="${V2X_UPSCALE_MODEL:-realesr-animevideov3}"
+V2X_INTERP_FACTOR="${V2X_INTERP_FACTOR:-2}"
+V2X_INTERP_MODEL="${V2X_INTERP_MODEL:-rife-v4.6}"
+V2X_EXTRA_ARGS="${V2X_EXTRA_ARGS:-}"
 
-AUDIO_FILTER="${AUDIO_FILTER:-highpass=f=80,anlmdn=s=7:p=0.002:m=15,loudnorm=I=-16:TP=-1.5:LRA=11,alimiter=level_in=1:level_out=1:limit=0.95:release=50}"
-AUDIO_CODEC="${AUDIO_CODEC:-aac}"
-AUDIO_BITRATE="${AUDIO_BITRATE:-256k}"
-AUDIO_SAMPLE_RATE="${AUDIO_SAMPLE_RATE:-48000}"
+# Dual GPU config — workers per GPU
+# GPU0: RTX 5070 Ti (fast), GPU1: RTX 2060 (slower)
+GPU0="${GPU0:-0}"
+GPU1="${GPU1:-1}"
+GPU0_WORKERS="${GPU0_WORKERS:-3}"
+GPU1_WORKERS="${GPU1_WORKERS:-1}"
 
 CHUNK_MINUTES="${CHUNK_MINUTES:-15}"
-WORKDIR="${WORKDIR:-}"                            # default: next to input
+WORKDIR="${WORKDIR:-}"
 
 # ── Args ─────────────────────────────────────────────────────
-INPUT="${1:?Usage: $0 input.mp4 [output.mp4] [audio_sidecar.m4a]}"
+INPUT="${1:?Usage: $0 input.mp4 [output.mkv]}"
 INPUT="$(realpath "$INPUT")"
 BASENAME="$(basename "${INPUT%.*}")"
 
-OUTPUT="${2:-$(dirname "$INPUT")/${BASENAME}_enhanced.mp4}"
+OUTPUT="${2:-$(dirname "$INPUT")/${BASENAME}_enhanced.mkv}"
 OUTPUT="$(realpath "$OUTPUT")"
-
-AUDIO_SIDECAR="${3:-}"
 
 # ── Derived paths ────────────────────────────────────────────
 WORK="${WORKDIR:-$(dirname "$OUTPUT")/work_${BASENAME}}"
 CHUNKS_DIR="$WORK/chunks"
 UPSCALED_DIR="$WORK/upscaled"
 INTERP_DIR="$WORK/interpolated"
-AUDIO_OUT="$WORK/${BASENAME}_audio_enhanced.m4a"
 mkdir -p "$CHUNKS_DIR" "$UPSCALED_DIR" "$INTERP_DIR"
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -62,9 +58,7 @@ die() { log "ERROR: $*" >&2; exit 1; }
 check_deps() {
     command -v ffmpeg  >/dev/null || die "ffmpeg not found"
     command -v ffprobe >/dev/null || die "ffprobe not found"
-    if ! command -v "$V2X_BIN" >/dev/null 2>&1 && [[ ! -x "$V2X_BIN" ]]; then
-        die "video2x not found. Install it or set V2X_BIN=/path/to/Video2X-x86_64.AppImage"
-    fi
+    [[ -x "$V2X_BIN" ]] || die "Video2X not found at $V2X_BIN"
 }
 
 get_duration() {
@@ -77,25 +71,6 @@ get_video_info() {
         -of csv=p=0 "$1"
 }
 
-find_audio_source() {
-    # Priority: explicit sidecar > .m4a next to video > embedded audio
-    if [[ -n "$AUDIO_SIDECAR" && -f "$AUDIO_SIDECAR" ]]; then
-        echo "$AUDIO_SIDECAR"; return
-    fi
-    local dir stem m4a
-    dir="$(dirname "$INPUT")"
-    stem="$(basename "${INPUT%.*}")"
-    # Try exact stem match (e.g. Recording.m4a for Recording_2240x1260.mp4)
-    for m4a in "$dir/${stem}.m4a" "$dir/$(echo "$stem" | sed 's/_[0-9]*x[0-9]*$//').m4a"; do
-        [[ -f "$m4a" ]] && { echo "$m4a"; return; }
-    done
-    # Fall back to embedded audio
-    if ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$INPUT" | grep -q .; then
-        echo "$INPUT"; return
-    fi
-    echo ""
-}
-
 # ── Step 1: Split into chunks ────────────────────────────────
 split_chunks() {
     local dur chunk_s n_chunks
@@ -103,7 +78,7 @@ split_chunks() {
     chunk_s=$((CHUNK_MINUTES * 60))
     n_chunks=$(( (dur + chunk_s - 1) / chunk_s ))
 
-    log "Splitting $INPUT ($((dur/3600))h$((dur%3600/60))m) into $n_chunks chunks of ${CHUNK_MINUTES}min"
+    log "Splitting $INPUT ($((dur/3600))h$((dur%3600/60))m) into ~$n_chunks chunks of ${CHUNK_MINUTES}min"
 
     local existing
     existing=$(find "$CHUNKS_DIR" -name 'chunk_*.mp4' 2>/dev/null | wc -l)
@@ -122,92 +97,124 @@ split_chunks() {
     log "Split done: $(ls "$CHUNKS_DIR"/chunk_*.mp4 | wc -l) chunks"
 }
 
-# ── Step 2: Upscale + interpolate via Video2X ────────────────
+# ── Step 2: Process a single chunk (upscale + interpolate) ───
 process_chunk() {
     local chunk="$1"
+    local gpu="$2"
     local name out_up out_interp done_flag
     name="$(basename "${chunk%.*}")"
     out_up="$UPSCALED_DIR/${name}_upscaled.mp4"
     out_interp="$INTERP_DIR/${name}_enhanced.mp4"
     done_flag="$INTERP_DIR/${name}.done"
 
-    if [[ -f "$done_flag" ]]; then
-        return 0
-    fi
+    [[ -f "$done_flag" ]] && return 0
 
-    log "  Processing $name ..."
+    log "  [GPU$gpu] Processing $name ..."
 
     # Pass 1: Upscale with Real-ESRGAN
     if [[ ! -f "$out_up" || "$(stat -c%s "$out_up" 2>/dev/null || echo 0)" -le 1000 ]]; then
-        log "    ↑ Upscaling ×${V2X_UPSCALE_FACTOR} (${V2X_UPSCALE_MODEL})"
+        log "    [GPU$gpu] ↑ Upscaling ×${V2X_UPSCALE_FACTOR} ($name)"
         "$V2X_BIN" -i "$chunk" -o "$out_up" \
             -p realesrgan \
             -s "${V2X_UPSCALE_FACTOR}" \
             --realesrgan-model "${V2X_UPSCALE_MODEL}" \
-            -d "${V2X_GPU}" \
+            -d "${gpu}" \
             $V2X_EXTRA_ARGS \
-            2>&1 | tail -1
+            2>&1 | tail -1 || true
     fi
 
     if [[ ! -f "$out_up" || "$(stat -c%s "$out_up" 2>/dev/null || echo 0)" -le 1000 ]]; then
-        log "  ✗ $name upscale FAILED"
+        log "  ✗ [GPU$gpu] $name upscale FAILED"
         return 1
     fi
 
-    # Pass 2: Frame interpolation with RIFE (skip if factor is 1)
+    # Pass 2: Frame interpolation with RIFE
     if [[ "$V2X_INTERP_FACTOR" -le 1 ]]; then
         cp "$out_up" "$out_interp"
     else
-        log "    ↗ Interpolating ×${V2X_INTERP_FACTOR} FPS (${V2X_INTERP_MODEL})"
+        log "    [GPU$gpu] ↗ Interpolating ×${V2X_INTERP_FACTOR} FPS ($name)"
         "$V2X_BIN" -i "$out_up" -o "$out_interp" \
             -p rife \
             -m "${V2X_INTERP_FACTOR}" \
             --rife-model "${V2X_INTERP_MODEL}" \
-            -d "${V2X_GPU}" \
+            -d "${gpu}" \
             $V2X_EXTRA_ARGS \
-            2>&1 | tail -1
+            2>&1 | tail -1 || true
     fi
 
     if [[ -f "$out_interp" && "$(stat -c%s "$out_interp" 2>/dev/null || echo 0)" -gt 1000 ]]; then
         touch "$done_flag"
-        # Clean up intermediate upscale file to save disk
         rm -f "$out_up"
-        log "  ✓ $name done"
+        log "  ✓ [GPU$gpu] $name done"
     else
-        log "  ✗ $name interpolation FAILED"
+        log "  ✗ [GPU$gpu] $name interpolation FAILED"
         return 1
     fi
 }
 
+# ── Step 3: Dual-GPU worker dispatcher ───────────────────────
 run_video2x() {
     local chunks=("$CHUNKS_DIR"/chunk_*.mp4)
     local total=${#chunks[@]}
     local done_count
     done_count=$(find "$INTERP_DIR" -name '*.done' 2>/dev/null | wc -l)
+    local remaining=$((total - done_count))
 
-    log "Video2X: $total chunks, $done_count already done, $((total - done_count)) remaining"
-    log "Workers: $V2X_GPU_WORKERS parallel | GPU: $V2X_GPU"
+    log "Video2X: $total chunks, $done_count done, $remaining remaining"
+    log "GPU0 (device $GPU0): $GPU0_WORKERS workers"
+    log "GPU1 (device $GPU1): $GPU1_WORKERS workers"
 
-    local pids=() running=0 fails=0
+    if [[ "$remaining" -le 0 ]]; then
+        log "All chunks already processed, skipping"
+        return
+    fi
+
+    # Build list of pending chunks
+    local pending=()
     for chunk in "${chunks[@]}"; do
         local name done_flag
         name="$(basename "${chunk%.*}")"
         done_flag="$INTERP_DIR/${name}.done"
-        [[ -f "$done_flag" ]] && continue
+        [[ -f "$done_flag" ]] || pending+=("$chunk")
+    done
 
-        # Throttle: wait if max workers reached
-        while (( running >= V2X_GPU_WORKERS )); do
-            wait -n -p wpid 2>/dev/null || true
-            running=$((running - 1))
+    # Semaphore-style dispatch with per-GPU slot tracking
+    local gpu0_running=0 gpu1_running=0
+    local -a pids_gpu0=() pids_gpu1=()
+    local fails=0
+    local dispatched=0
+
+    for chunk in "${pending[@]}"; do
+        # Wait for a free slot on either GPU
+        while (( gpu0_running >= GPU0_WORKERS && gpu1_running >= GPU1_WORKERS )); do
+            sleep 2
+            local new0=0 new1=0
+            for p in "${pids_gpu0[@]}"; do kill -0 "$p" 2>/dev/null && new0=$((new0+1)); done
+            for p in "${pids_gpu1[@]}"; do kill -0 "$p" 2>/dev/null && new1=$((new1+1)); done
+            gpu0_running=$new0
+            gpu1_running=$new1
         done
 
-        process_chunk "$chunk" &
-        pids+=($!)
-        running=$((running + 1))
+        # Assign to GPU with free slots (prefer GPU0 — faster)
+        local gpu
+        if (( gpu0_running < GPU0_WORKERS )); then
+            gpu="$GPU0"
+            process_chunk "$chunk" "$gpu" &
+            pids_gpu0+=($!)
+            gpu0_running=$((gpu0_running + 1))
+        else
+            gpu="$GPU1"
+            process_chunk "$chunk" "$gpu" &
+            pids_gpu1+=($!)
+            gpu1_running=$((gpu1_running + 1))
+        fi
+        dispatched=$((dispatched + 1))
+        log "Dispatched $dispatched/${#pending[@]} → GPU$gpu (GPU0: $gpu0_running/$GPU0_WORKERS, GPU1: $gpu1_running/$GPU1_WORKERS)"
     done
 
     # Wait for all remaining
-    for pid in "${pids[@]}"; do
+    local all_pids=("${pids_gpu0[@]}" "${pids_gpu1[@]}")
+    for pid in "${all_pids[@]}"; do
         wait "$pid" || fails=$((fails + 1))
     done
 
@@ -216,41 +223,10 @@ run_video2x() {
     [[ "$fails" -eq 0 ]] || die "$fails chunks failed"
 }
 
-# ── Step 3: Audio enhancement ────────────────────────────────
-enhance_audio() {
-    local audio_src
-    audio_src="$(find_audio_source)"
-
-    if [[ -z "$audio_src" ]]; then
-        log "No audio source found, skipping audio"
-        AUDIO_OUT=""
-        return
-    fi
-
-    if [[ -f "$AUDIO_OUT" && "$(stat -c%s "$AUDIO_OUT" 2>/dev/null || echo 0)" -gt 1024 ]]; then
-        log "Audio already enhanced, skipping"
-        return
-    fi
-
-    log "Enhancing audio from $(basename "$audio_src")"
-    ffmpeg -y -i "$audio_src" \
-        -vn -map 0:a:0 \
-        -af "$AUDIO_FILTER" \
-        -c:a "$AUDIO_CODEC" \
-        -b:a "$AUDIO_BITRATE" \
-        -ar "$AUDIO_SAMPLE_RATE" \
-        -movflags +faststart \
-        "$AUDIO_OUT" \
-        -loglevel warning
-
-    log "Audio done: $(du -h "$AUDIO_OUT" | cut -f1)"
-}
-
-# ── Step 4: Concatenate + mux ────────────────────────────────
+# ── Step 4: Concatenate + mux with ORIGINAL audio ────────────
 concat_and_mux() {
     local concat_file="$WORK/concat.txt"
 
-    # Build concat list (sorted)
     > "$concat_file"
     for f in $(ls "$INTERP_DIR"/chunk_*_enhanced.mp4 2>/dev/null | sort); do
         echo "file '$f'" >> "$concat_file"
@@ -260,21 +236,22 @@ concat_and_mux() {
     n_files=$(wc -l < "$concat_file")
     [[ "$n_files" -gt 0 ]] || die "No enhanced chunks found in $INTERP_DIR"
 
-    log "Concatenating $n_files chunks + muxing audio → $OUTPUT"
+    log "Concatenating $n_files chunks → $OUTPUT"
 
-    local cmd=(ffmpeg -y -f concat -safe 0 -i "$concat_file")
-    if [[ -n "$AUDIO_OUT" && -f "$AUDIO_OUT" ]]; then
-        cmd+=(-i "$AUDIO_OUT" -map 0:v -map 1:a:0 -shortest -c:a copy)
-    else
-        cmd+=(-map 0:v)
-    fi
-    cmd+=(-c:v copy -movflags +faststart "$OUTPUT" -loglevel warning)
-
-    "${cmd[@]}"
+    # Mux with ORIGINAL audio from input (copy, no re-encoding)
+    # Preserves perfect A/V sync by using the original audio stream
+    ffmpeg -y \
+        -f concat -safe 0 -i "$concat_file" \
+        -i "$INPUT" \
+        -map 0:v:0 -map 1:a:0 \
+        -c:v copy -c:a copy \
+        -shortest \
+        "$OUTPUT" \
+        -loglevel warning
 
     local size
     size="$(du -h "$OUTPUT" | cut -f1)"
-    log "✓ DONE: $OUTPUT ($size)"
+    log "✓ OUTPUT: $OUTPUT ($size)"
 }
 
 # ── Main ─────────────────────────────────────────────────────
@@ -284,27 +261,26 @@ main() {
     local info dur
     info="$(get_video_info "$INPUT")"
     dur="$(get_duration "$INPUT")"
+    local total_workers=$((GPU0_WORKERS + GPU1_WORKERS))
 
     log "═══════════════════════════════════════════"
-    log "  VIDEO ENHANCEMENT"
+    log "  VIDEO ENHANCEMENT — DUAL GPU"
     log "═══════════════════════════════════════════"
-    log "  Input:   $(basename "$INPUT")"
-    log "  Info:    ${info} | ${dur}s ($((dur/3600))h$((dur%3600/60))m)"
-    log "  Output:  $(basename "$OUTPUT")"
-    log "  Upscale: ${V2X_UPSCALE_MODEL} ×${V2X_UPSCALE_FACTOR}"
-    log "  Interp:  ${V2X_INTERP_MODEL} ×${V2X_INTERP_FACTOR}"
-    log "  Workers: ${V2X_GPU_WORKERS}"
-    log "  Audio:   ${AUDIO_CODEC} ${AUDIO_BITRATE}"
+    log "  Input:    $(basename "$INPUT")"
+    log "  Info:     ${info} | ${dur}s ($((dur/3600))h$((dur%3600/60))m)"
+    log "  Output:   $(basename "$OUTPUT")"
+    log "  Upscale:  ${V2X_UPSCALE_MODEL} ×${V2X_UPSCALE_FACTOR}"
+    log "  Interp:   ${V2X_INTERP_MODEL} ×${V2X_INTERP_FACTOR}"
+    log "  GPU0:     device $GPU0 — $GPU0_WORKERS workers"
+    log "  GPU1:     device $GPU1 — $GPU1_WORKERS workers"
+    log "  Total:    $total_workers parallel workers"
+    log "  Chunks:   ${CHUNK_MINUTES}min each"
+    log "  Audio:    original (copied as-is)"
+    log "  Work:     $WORK"
     log "═══════════════════════════════════════════"
 
     split_chunks
-    enhance_audio &
-    local audio_pid=$!
-
     run_video2x
-
-    wait "$audio_pid" 2>/dev/null || log "Audio process finished"
-
     concat_and_mux
 
     log "═══════════════════════════════════════════"
