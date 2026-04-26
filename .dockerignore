@@ -1,0 +1,12 @@
+output/
+videos/
+enhanced/
+deliverables/
+work/
+.cache/
+backups/
+Video2X-x86_64.AppImage
+*.mkv
+*.mp4
+*.wav
+*.m4a

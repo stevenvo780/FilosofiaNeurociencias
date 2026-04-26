@@ -9,7 +9,11 @@ enhanced/
 output
 
 # Work directories
+work/
 work_*/
+.cache/
+__pycache__/
+scripts/__pycache__/
 
 # Video2X AppImage
 *.AppImage
@@ -18,3 +22,5 @@ work_*/
 nohup.out
 *.log
 backups/
+deliverables/
+logs/
