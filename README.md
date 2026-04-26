@@ -1,125 +1,241 @@
-# Video Enhancement Pipeline
+# FilosofiaNeurociencias
 
-> Toma un video → duplica resolución → duplica FPS → limpia audio.
+Guía operativa del proyecto para producir:
 
+- video con **doble resolución + doble FPS**,
+- audio final **bueno de verdad** (`*_audio_mejorado.wav`),
+- subtítulos en **español** y **inglés**,
+- y, si se quiere, un **MKV final** con todo muxeado.
+
+## Estado actual del proyecto
+
+### Qué quedó como resultado final válido
+
+El audio que finalmente **sí quedó mejor** y se toma como referencia es:
+
+- `*_audio_mejorado.wav`
+
+En este repo, el flujo canónico para audio es el modo:
+
+- `AUDIO_MODE=safe`
+
+Ese flujo fue el que dio el mejor equilibrio entre limpieza, inteligibilidad y ausencia de artefactos.
+
+### Qué NO tomar como referencia final
+
+Estos flujos existieron como pruebas o experimentos, pero **no son la referencia final**:
+
+- `*_audio_ia_deepfilter.wav`
+- `*_audio_ia_multietapa.wav`
+- scripts históricos de DeepFilter/Resemble para pruebas puntuales
+
+No se borran de la historia del proyecto, pero **no son lo que conviene regenerar por defecto**.
+
+## Salidas canónicas por charla
+
+La estructura esperada por charla es esta:
+
+```text
+output/charlaN/
+├── charlaN.mp4
+├── charlaN_audio_mejorado.wav
+├── charlaN.es.srt
+├── charlaN.en.srt
+└── charlaN_final.mkv
 ```
-Entrada: 2240×1260 @ 25fps  →  Salida: 4480×2520 @ 50fps + audio mejorado
+
+> Si algún archivo final fue borrado manualmente, se puede regenerar con los scripts del repo.
+
+## Scripts que sí mandan aquí
+
+### `enhance.sh`
+
+Genera video con:
+
+- resolución ×2
+- FPS ×2
+- conserva el audio original del input
+
+Internamente usa:
+
+- **Video2X**
+- **Real-ESRGAN** para upscale
+- **RIFE** para interpolación
+
+### `scripts/process_charlas_gpu.sh`
+
+Es el script recomendado para las charlas segmentadas (`output/charla*.mp4`).
+
+Hace esto:
+
+1. mejora el audio,
+2. genera subtítulos,
+3. traduce cuando hace falta,
+4. crea `*_final.mkv`.
+
+El modo recomendado es:
+
+- `AUDIO_MODE=safe`
+
+Ese modo usa el filtro conservador:
+
+```text
+highpass=f=70,lowpass=f=12000,afftdn=nr=6:nf=-35,loudnorm=I=-24:LRA=11:TP=-3:linear=true
 ```
+
+### Scripts históricos o experimentales
+
+Estos sirven como referencia técnica, pero no como flujo canónico por defecto:
+
+- `scripts/run_audio_multistage_cuda_docker.sh`
+- `scripts/batch_audio_multistage_cuda.sh`
+- `scripts/run_deepfilter_cuda_docker.sh`
+- `audio_df_parallel.sh`
+- `enhance_audio_after.sh`
+- `scripts/enhance_audio_resemble.py`
+- `scripts/denoise_audio_resemble.py`
 
 ## Requisitos
 
-- **[Video2X](https://github.com/k4yt3x/video2x)** — Real-ESRGAN (upscale) + RIFE (interpolación)
-- **ffmpeg** + **ffprobe** — split, concat, audio
-- **GPU con Vulkan** — NVIDIA, AMD o Intel
+### Para video x2 / 50 fps
 
-### Instalar Video2X
+- `ffmpeg`
+- `ffprobe`
+- `Video2X-x86_64.AppImage` o `video2x`
+- GPU con soporte Vulkan
+
+### Para audio + subtítulos
+
+- `ffmpeg`
+- Docker
+- runtime de NVIDIA para Docker
+- GPU CUDA para `whisper.cpp`
+
+El script `scripts/process_charlas_gpu.sh` bootstrappea automáticamente `whisper.cpp` mediante:
+
+- `scripts/bootstrap_whispercpp_cuda.sh`
+
+## Flujo recomendado de trabajo
+
+### Opción A — Sólo sacar audio mejorado + subtítulos + MKV final por charla
+
+Si ya tienes `output/charla1.mp4`, `output/charla2.mp4`, etc., este es el flujo más útil y más estable:
 
 ```bash
-# AppImage (cualquier distro Linux)
-wget https://github.com/k4yt3x/video2x/releases/latest/download/Video2X-x86_64.AppImage
-chmod +x Video2X-x86_64.AppImage
-export V2X_BIN="$PWD/Video2X-x86_64.AppImage"
-
-# Arch Linux
-yay -S video2x
+DELIVER_DIR="$PWD/output" \
+AUDIO_MODE=safe \
+./scripts/process_charlas_gpu.sh
 ```
 
-## Uso
+Esto genera por charla:
+
+- `*_audio_mejorado.wav`
+- `*.es.srt`
+- `*.en.srt`
+- `*_final.mkv`
+
+Si sólo quieres una charla concreta:
 
 ```bash
-# Básico — output junto al input
-./enhance.sh video.mp4
-
-# Especificar output
-./enhance.sh video.mp4 video_4k_50fps.mp4
-
-# Con audio externo (sidecar .m4a de Zoom, etc.)
-./enhance.sh video.mp4 output.mp4 audio.m4a
+INPUT_PATTERN="$PWD/output/charla4.mp4" \
+DELIVER_DIR="$PWD/output" \
+AUDIO_MODE=safe \
+./scripts/process_charlas_gpu.sh
 ```
 
-### Variables de entorno
+### Opción B — Hacer primero el video con doble calidad
 
-| Variable | Default | Descripción |
+Para producir un video con resolución ×2 y FPS ×2:
+
+```bash
+./enhance.sh input.mp4 output_4K50.mkv
+```
+
+Ejemplo real del repo:
+
+```bash
+./enhance.sh videos/GMT20260320-130023_Recording_2240x1260.mp4 output/GMT20260320-130023_Recording_2240x1260_4K50.mkv
+```
+
+Qué hace `enhance.sh`:
+
+1. divide el video en chunks,
+2. hace upscale con Real-ESRGAN,
+3. interpola cuadros con RIFE,
+4. concatena el resultado,
+5. conserva el audio original del input.
+
+### Opción C — Combinar ambas cosas: video x2 + audio mejorado + subtítulos
+
+Ese resultado final se produce en dos etapas:
+
+1. generar el video mejorado visualmente con `enhance.sh`,
+2. generar `*_audio_mejorado.wav` y subtítulos,
+3. hacer el mux final.
+
+Ejemplo de mux manual:
+
+```bash
+ffmpeg -y \
+	-i output/charla4/charla4_4K50.mkv \
+	-i output/charla4/charla4_audio_mejorado.wav \
+	-i output/charla4/charla4.es.srt \
+	-i output/charla4/charla4.en.srt \
+	-map 0:v:0 -map 1:a:0 -map 2:0 -map 3:0 \
+	-c:v copy \
+	-c:a aac -b:a 192k \
+	-c:s srt \
+	-metadata:s:s:0 language=spa \
+	-metadata:s:s:0 title="Español" \
+	-metadata:s:s:1 language=eng \
+	-metadata:s:s:1 title="English" \
+	-shortest \
+	output/charla4/charla4_4K50_final.mkv
+```
+
+## Variables útiles
+
+### `enhance.sh`
+
+| Variable | Default | Uso |
 |---|---|---|
-| `V2X_BIN` | `video2x` | Ruta al binario/AppImage de Video2X |
+| `V2X_BIN` | `./Video2X-x86_64.AppImage` | Binario de Video2X |
 | `V2X_UPSCALE_FACTOR` | `2` | Multiplicador de resolución |
-| `V2X_UPSCALE_MODEL` | `realesr-animevideov3` | Modelo Real-ESRGAN |
 | `V2X_INTERP_FACTOR` | `2` | Multiplicador de FPS |
-| `V2X_INTERP_MODEL` | `rife-v4.6` | Modelo RIFE |
-| `V2X_GPU` | `0` | Índice de dispositivo Vulkan |
-| `V2X_GPU_WORKERS` | `4` | Workers paralelos por chunk |
-| `CHUNK_MINUTES` | `15` | Minutos por chunk |
-| `AUDIO_FILTER` | `highpass+anlmdn+loudnorm+alimiter` | Filtro ffmpeg de audio |
+| `GPU0_WORKERS` | `3` | Workers en GPU rápida |
+| `GPU1_WORKERS` | `1` | Workers en GPU secundaria |
+| `CHUNK_MINUTES` | `15` | Duración de chunk |
 
-### Ejemplos
+### `scripts/process_charlas_gpu.sh`
+
+| Variable | Default | Uso |
+|---|---|---|
+| `INPUT_PATTERN` | `output/charla*.mp4` | Charlas de entrada |
+| `DELIVER_DIR` | `output` | Carpeta de salida |
+| `AUDIO_MODE` | `safe` | **Modo recomendado** |
+| `FORCE_REGEN_AUDIO` | `0` | Rehacer audio |
+| `FORCE_REGEN_ASR` | `0` | Rehacer transcripción |
+| `FORCE_REMUX_FINAL` | `0` | Rehacer sólo el MKV final |
+
+Si quieres regenerar sólo el MKV final sin rehacer audio ni subtítulos:
 
 ```bash
-# Más workers para saturar la GPU
-V2X_GPU_WORKERS=6 ./enhance.sh video.mp4
-
-# AppImage custom
-V2X_BIN=./Video2X-x86_64.AppImage ./enhance.sh video.mp4
-
-# Solo upscale sin interpolación
-V2X_INTERP_FACTOR=1 ./enhance.sh video.mp4
-
-# Upscale ×4 (requiere más VRAM)
-V2X_UPSCALE_FACTOR=4 ./enhance.sh video.mp4
+DELIVER_DIR="$PWD/output" \
+FORCE_REMUX_FINAL=1 \
+./scripts/process_charlas_gpu.sh
 ```
 
-## Qué hace el script
+## Decisión operativa para el futuro
 
-```
-1. Split      →  ffmpeg divide el video en chunks de N min (-c copy, sin re-encode)
-2. Upscale    →  Video2X: realesrgan -s N  (por chunk, en paralelo)
-3. Interpolar →  Video2X: rife -m N        (por chunk, en paralelo)
-4. Audio      →  ffmpeg aplica filtro de limpieza (en paralelo con pasos 2-3)
-5. Concat     →  ffmpeg concatena chunks + muxa audio mejorado
-```
+Si mañana hay que volver a producir todo, la recomendación es:
 
-Video2X ejecuta un procesador por invocación, así que upscale e interpolación
-son dos pasadas separadas por chunk. Los intermedios de upscale se eliminan
-automáticamente después de interpolar.
+1. **Video**: usar `enhance.sh`.
+2. **Audio/Subtítulos**: usar `scripts/process_charlas_gpu.sh` con `AUDIO_MODE=safe`.
+3. **Resultado de audio a conservar**: `*_audio_mejorado.wav`.
+4. **No volver a tomar como referencia final** los audios IA multi-etapa salvo que se quiera reabrir la investigación.
 
-### Pipeline de audio
+## Historial y contexto
 
-```
-highpass=f=80              → elimina rumble <80Hz
-anlmdn=s=7:p=0.002:m=15   → denoising no-local means
-loudnorm=I=-16:TP=-1.5     → normalización EBU R128
-alimiter=limit=0.95        → limiter para evitar clipping
-```
+Para un resumen de qué se probó, qué salió mal y qué terminó quedándose, ver:
 
-## Hardware de referencia
-
-| Componente | Modelo | Notas |
-|---|---|---|
-| CPU | Ryzen 9 9950X3D | ffmpeg encode/decode |
-| GPU0 | RTX 5070 Ti 16GB | 4 workers ESRGAN |
-| GPU1 | RTX 2060 6GB | 1 worker (PCIe ×4) |
-| RAM | 128 GB DDR5 | — |
-
-Con 5 workers totales en producción: **~8.5 FPS** para upscale ×2.
-
-## Estructura
-
-```
-.
-├── enhance.sh       ← el script (esto es todo)
-├── videos/          ← videos de entrada
-├── enhanced/        ← outputs
-├── README.md
-├── TODO.md
-└── .gitignore
-```
-
-## Lección aprendida
-
-Se intentó un pipeline custom en Python (~4500 LOC, 12 archivos, ~30h):
-ESRGAN PyTorch, RIFE ncnn, streaming NVENC, scheduler CCD-aware, face-adaptive
-blending, perfiles de audio, progreso resumible por chunk...
-
-Al final, **Video2X con workers encolados hizo lo mismo con 0 líneas de código**.
-La única adición útil fue el filtro de audio de ffmpeg (~1 línea).
-
-> Si existe una herramienta open-source madura para tu problema, úsala primero.
+- `PROGRESO.md`
